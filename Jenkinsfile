@@ -53,16 +53,26 @@ pipeline {
                     CHROMIUM_VERSION="${CHROMIUM_VERSION:-}"
                     AUTO_DISCOVER="${AUTO_DISCOVER:-true}"
 
-                    [[ "$MIN_MAJOR" =~ ^[0-9]+$ ]] || {
-                        echo 'MIN_MAJOR must be numeric' >&2
-                        exit 1
-                    }
+                    case "$MIN_MAJOR" in
+                        ''|*[!0-9]*)
+                            echo 'MIN_MAJOR must be numeric' >&2
+                            exit 1
+                            ;;
+                    esac
 
                     if [[ -n "$CHROMIUM_VERSION" ]]; then
-                        [[ "$CHROMIUM_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+                        case "$CHROMIUM_VERSION" in
+                            *[!0-9.]*|.*|*.|*..* )
+                                echo "Invalid Chromium version: $CHROMIUM_VERSION" >&2
+                                exit 1
+                                ;;
+                        esac
+
+                        IFS=. read -r a b c d extra <<< "$CHROMIUM_VERSION"
+                        if [[ -n "${extra:-}" || -z "$a" || -z "$b" || -z "$c" || -z "$d" ]]; then
                             echo "Invalid Chromium version: $CHROMIUM_VERSION" >&2
                             exit 1
-                        }
+                        fi
                     elif [[ "$AUTO_DISCOVER" != true ]]; then
                         echo 'Either AUTO_DISCOVER must be enabled or CHROMIUM_VERSION must be set' >&2
                         exit 1
