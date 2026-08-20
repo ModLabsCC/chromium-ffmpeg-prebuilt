@@ -327,6 +327,7 @@ PY
                                         build-essential ca-certificates curl git nasm yasm \
                                         python3 pkg-config xz-utils binutils file >/dev/null
 
+                                    ROOT_DIR="$PWD"
                                     BUILD_DIR="work/build-$FFMPEG_REV"
                                     rm -rf "$BUILD_DIR"
                                     mkdir -p "$BUILD_DIR"
@@ -340,7 +341,7 @@ PY
                                     chmod +x /tmp/build-ffmpeg.sh
                                     /tmp/build-ffmpeg.sh linux-x64
 
-                                    cd "$WORKSPACE"
+                                    cd "$ROOT_DIR"
                                     install -Dm755 "$BUILD_DIR/ffmpeg/libffmpeg.so" "$BUILD_DIR/libffmpeg.so"
                                     file "$BUILD_DIR/libffmpeg.so"
                                     readelf -h "$BUILD_DIR/libffmpeg.so" | grep -q "DYN (Shared object file)"
