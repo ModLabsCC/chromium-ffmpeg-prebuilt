@@ -206,20 +206,17 @@ from pathlib import Path
 version = os.environ["VERSION"]
 text = Path(f"work/{version}/DEPS").read_text()
 
-patterns = [
-    r"[\"\x27]ffmpeg_revision[\"\x27]\\s*:\\s*[\"\x27]([0-9a-f]{40})[\"\x27]",
-    r"chromium/third_party/ffmpeg[^@]*@([0-9a-f]{40})",
-]
+pos = text.find("ffmpeg_revision")
+if pos < 0:
+    raise SystemExit("Could not find ffmpeg_revision in Chromium DEPS")
 
-for pattern in patterns:
-    match = re.search(pattern, text, re.S)
-    if match:
-        revision = match.group(1)
-        break
-else:
+window = text[pos:pos + 500]
+hashes = re.findall("[0-9a-f]{40}", window)
+if not hashes:
     raise SystemExit("Could not resolve ffmpeg_revision from Chromium DEPS")
 
-Path(f"work/{version}/ffmpeg-revision.txt").write_text(revision + "\\n")
+revision = hashes[0]
+Path(f"work/{version}/ffmpeg-revision.txt").write_text(revision + chr(10))
 print(revision)
 PY
                                             '
