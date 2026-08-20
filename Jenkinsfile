@@ -1,25 +1,55 @@
 pipeline {
     agent any
 
+    triggers {
+        cron('H */6 * * *')
+    }
+
     options {
         timestamps()
         disableConcurrentBuilds()
-        buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '10'))
-        timeout(time: 90, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '10'))
+        timeout(time: 6, unit: 'HOURS')
     }
 
     parameters {
+        booleanParam(
+            name: 'AUTO_DISCOVER',
+            defaultValue: true,
+            description: 'Discover and build every missing Chromium release tag'
+        )
         string(
             name: 'CHROMIUM_VERSION',
-            defaultValue: '150.0.7871.230',
-            description: 'Exact Chromium version/tag to build against'
+            defaultValue: '',
+            description: 'Optional exact Chromium version. When set, only this version is built.'
+        )
+        string(
+            name: 'MIN_MAJOR',
+            defaultValue: '150',
+            description: 'Oldest Chromium major to consider in automatic mode'
+        )
+        string(
+            name: 'R2_ENDPOINT',
+            defaultValue: '',
+            description: 'Cloudflare R2 S3 endpoint, e.g. https://<account-id>.r2.cloudflarestorage.com'
+        )
+        string(
+            name: 'R2_BUCKET',
+            defaultValue: 'chromium-ffmpeg-prebuilt',
+            description: 'Cloudflare R2 bucket'
+        )
+        string(
+            name: 'R2_PREFIX',
+            defaultValue: 'chromium',
+            description: 'Object prefix inside the bucket'
         )
     }
 
     environment {
         BUILD_IMAGE = 'ubuntu:24.04'
-        FFMPEG_GIT = 'https://chromium.googlesource.com/chromium/third_party/ffmpeg.git'
+        CHROMIUM_SRC = 'https://chromium.googlesource.com/chromium/src.git'
         CHROMIUM_GITILES = 'https://chromium.googlesource.com/chromium/src'
+        FFMPEG_GIT = 'https://chromium.googlesource.com/chromium/third_party/ffmpeg.git'
         NWJS_BUILD_SH = 'https://raw.githubusercontent.com/nwjs-ffmpeg-prebuilt/nwjs-ffmpeg-prebuilt/master/build.sh'
     }
 
@@ -28,156 +58,250 @@ pipeline {
             steps {
                 sh '''#!/usr/bin/env bash
                     set -euo pipefail
-                    [[ "${CHROMIUM_VERSION}" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$ ]] || {
-                        echo "Invalid Chromium version: ${CHROMIUM_VERSION}" >&2
+
+                    [[ "${MIN_MAJOR}" =~ ^[0-9]+$ ]] || {
+                        echo "MIN_MAJOR must be numeric" >&2
+                        exit 1
+                    }
+
+                    if [[ -n "${CHROMIUM_VERSION}" ]]; then
+                        [[ "${CHROMIUM_VERSION}" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$ ]] || {
+                            echo "Invalid Chromium version: ${CHROMIUM_VERSION}" >&2
+                            exit 1
+                        }
+                    elif [[ "${AUTO_DISCOVER}" != 'true' ]]; then
+                        echo 'Either AUTO_DISCOVER must be enabled or CHROMIUM_VERSION must be set' >&2
+                        exit 1
+                    fi
+
+                    [[ -n "${R2_ENDPOINT}" ]] || {
+                        echo 'R2_ENDPOINT is required' >&2
+                        exit 1
+                    }
+
+                    [[ -n "${R2_BUCKET}" ]] || {
+                        echo 'R2_BUCKET is required' >&2
                         exit 1
                     }
                 '''
             }
         }
 
-        stage('Resolve FFmpeg revision') {
+        stage('Discover releases') {
             steps {
-                sh '''#!/usr/bin/env bash
-                    set -euo pipefail
-                    rm -rf work out
-                    mkdir -p work out
+                withCredentials([
+                    string(credentialsId: 'r2-access-key-id', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'r2-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''#!/usr/bin/env bash
+                        set -euo pipefail
+                        rm -rf work out
+                        mkdir -p work out
 
-                    docker run --rm \
-                        -v "$PWD:/workspace" \
-                        -w /workspace \
-                        -e CHROMIUM_VERSION="${CHROMIUM_VERSION}" \
-                        "${BUILD_IMAGE}" \
-                        bash -ceu '
-                            apt-get update >/dev/null
-                            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                                ca-certificates curl python3 >/dev/null
+                        export AWS_DEFAULT_REGION=auto
 
-                            curl -fsSL \
-                                "https://chromium.googlesource.com/chromium/src/+/refs/tags/${CHROMIUM_VERSION}/DEPS?format=TEXT" \
-                                | base64 -d > work/DEPS
+                        docker run --rm \
+                            -v "$PWD:/workspace" \
+                            -w /workspace \
+                            -e CHROMIUM_VERSION="${CHROMIUM_VERSION}" \
+                            -e AUTO_DISCOVER="${AUTO_DISCOVER}" \
+                            -e MIN_MAJOR="${MIN_MAJOR}" \
+                            "${BUILD_IMAGE}" \
+                            bash -ceu '
+                                apt-get update >/dev/null
+                                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                                    ca-certificates git python3 >/dev/null
 
-                            python3 - <<"PY"
+                                if [[ -n "${CHROMIUM_VERSION}" ]]; then
+                                    printf "%s\\n" "${CHROMIUM_VERSION}" > work/candidates.txt
+                                    exit 0
+                                fi
+
+                                git ls-remote --tags --refs "${CHROMIUM_SRC}" \
+                                    | awk "{print \\$2}" \
+                                    | sed "s#refs/tags/##" \
+                                    | grep -E "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$" \
+                                    | awk -F. -v min="${MIN_MAJOR}" "\\$1 >= min" \
+                                    | sort -Vu > work/candidates.txt
+                            '
+
+                        : > work/versions.txt
+
+                        while IFS= read -r version; do
+                            [[ -n "$version" ]] || continue
+                            key="${R2_PREFIX}/${version}/linux-x64/manifest.json"
+
+                            if aws s3api head-object \
+                                --endpoint-url "${R2_ENDPOINT}" \
+                                --bucket "${R2_BUCKET}" \
+                                --key "$key" >/dev/null 2>&1; then
+                                echo "Already published: $version"
+                            else
+                                echo "Missing: $version"
+                                printf '%s\\n' "$version" >> work/versions.txt
+                            fi
+                        done < work/candidates.txt
+
+                        echo "Versions queued: $(wc -l < work/versions.txt)"
+                        cat work/versions.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Build and publish') {
+            steps {
+                script {
+                    def versionsText = readFile('work/versions.txt').trim()
+                    if (!versionsText) {
+                        echo 'Nothing to build; R2 already contains all discovered releases.'
+                        return
+                    }
+
+                    def versions = versionsText.split('\\n')
+
+                    for (String version : versions) {
+                        version = version.trim()
+                        if (!version) {
+                            continue
+                        }
+
+                        stage("Chromium ${version}") {
+                            withEnv(["TARGET_CHROMIUM_VERSION=${version}"]) {
+                                withCredentials([
+                                    string(credentialsId: 'r2-access-key-id', variable: 'AWS_ACCESS_KEY_ID'),
+                                    string(credentialsId: 'r2-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
+                                ]) {
+                                    sh '''#!/usr/bin/env bash
+                                        set -euo pipefail
+
+                                        export AWS_DEFAULT_REGION=auto
+                                        VERSION="${TARGET_CHROMIUM_VERSION}"
+                                        VERSION_DIR="out/${VERSION}/linux-x64"
+                                        WORK_DIR="work/${VERSION}"
+                                        mkdir -p "$VERSION_DIR" "$WORK_DIR"
+
+                                        echo "Resolving FFmpeg revision for Chromium ${VERSION}"
+
+                                        docker run --rm \
+                                            -v "$PWD:/workspace" \
+                                            -w /workspace \
+                                            -e VERSION="$VERSION" \
+                                            "${BUILD_IMAGE}" \
+                                            bash -ceu '
+                                                apt-get update >/dev/null
+                                                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                                                    ca-certificates curl python3 >/dev/null
+
+                                                curl -fsSL \
+                                                    "${CHROMIUM_GITILES}/+/refs/tags/${VERSION}/DEPS?format=TEXT" \
+                                                    | base64 -d > "work/${VERSION}/DEPS"
+
+                                                python3 - <<"PY"
+import os
 import re
 from pathlib import Path
 
-text = Path("work/DEPS").read_text()
+version = os.environ["VERSION"]
+text = Path(f"work/{version}/DEPS").read_text()
 
-# Chromium DEPS keeps the ffmpeg checkout as a git dependency. Restrict the
-# search to the dependency entry so we do not accidentally pick another hash.
-m = re.search(
-    r"['\\\"]src/third_party/ffmpeg['\\\"]\\s*:\\s*.*?@['\\\"]?([0-9a-f]{40})",
-    text,
-    re.S,
-)
-if not m:
-    # Some DEPS revisions format the URL/hash across helper expressions.
-    p = text.find("src/third_party/ffmpeg")
-    if p < 0:
-        raise SystemExit("Could not find src/third_party/ffmpeg in Chromium DEPS")
-    window = text[p:p + 1500]
-    hashes = re.findall(r"[0-9a-f]{40}", window)
-    if not hashes:
-        raise SystemExit("Could not resolve FFmpeg revision from Chromium DEPS")
-    rev = hashes[0]
+patterns = [
+    r"[\"\x27]ffmpeg_revision[\"\x27]\\s*:\\s*[\"\x27]([0-9a-f]{40})[\"\x27]",
+    r"chromium/third_party/ffmpeg[^@]*@([0-9a-f]{40})",
+]
+
+for pattern in patterns:
+    match = re.search(pattern, text, re.S)
+    if match:
+        revision = match.group(1)
+        break
 else:
-    rev = m.group(1)
+    raise SystemExit("Could not resolve ffmpeg_revision from Chromium DEPS")
 
-Path("work/ffmpeg-revision.txt").write_text(rev + "\\n")
-print(rev)
+Path(f"work/{version}/ffmpeg-revision.txt").write_text(revision + "\\n")
+print(revision)
 PY
-                        '
+                                            '
 
-                    echo "Resolved FFmpeg revision: $(cat work/ffmpeg-revision.txt)"
-                '''
-            }
-        }
+                                        FFMPEG_REV="$(cat "$WORK_DIR/ffmpeg-revision.txt")"
+                                        echo "FFmpeg revision: ${FFMPEG_REV}"
 
-        stage('Build') {
-            steps {
-                sh '''#!/usr/bin/env bash
-                    set -euo pipefail
+                                        docker run --rm \
+                                            -v "$PWD:/workspace" \
+                                            -w /workspace \
+                                            -e VERSION="$VERSION" \
+                                            -e FFMPEG_REV="$FFMPEG_REV" \
+                                            -e FFMPEG_GIT="${FFMPEG_GIT}" \
+                                            -e NWJS_BUILD_SH="${NWJS_BUILD_SH}" \
+                                            "${BUILD_IMAGE}" \
+                                            bash -ceu '
+                                                export DEBIAN_FRONTEND=noninteractive
+                                                apt-get update >/dev/null
+                                                apt-get install -y --no-install-recommends \
+                                                    build-essential ca-certificates curl git nasm yasm \
+                                                    python3 pkg-config xz-utils binutils file >/dev/null
 
-                    docker run --rm \
-                        -v "$PWD:/workspace" \
-                        -w /workspace \
-                        -e CHROMIUM_VERSION="${CHROMIUM_VERSION}" \
-                        -e FFMPEG_GIT="${FFMPEG_GIT}" \
-                        -e NWJS_BUILD_SH="${NWJS_BUILD_SH}" \
-                        "${BUILD_IMAGE}" \
-                        bash -ceu '
-                            export DEBIAN_FRONTEND=noninteractive
-                            apt-get update >/dev/null
-                            apt-get install -y --no-install-recommends \
-                                build-essential \
-                                ca-certificates \
-                                curl \
-                                git \
-                                nasm \
-                                yasm \
-                                python3 \
-                                pkg-config \
-                                xz-utils \
-                                binutils \
-                                file >/dev/null
+                                                rm -rf "work/${VERSION}/ffmpeg"
+                                                git clone -q "${FFMPEG_GIT}" "work/${VERSION}/ffmpeg"
+                                                cd "work/${VERSION}/ffmpeg"
+                                                git checkout -q "${FFMPEG_REV}"
 
-                            FFMPEG_REV="$(cat work/ffmpeg-revision.txt)"
-                            rm -rf work/ffmpeg
-                            git clone -q "${FFMPEG_GIT}" work/ffmpeg
-                            cd work/ffmpeg
-                            git checkout -q "${FFMPEG_REV}"
+                                                curl -fsSL "${NWJS_BUILD_SH}" -o /tmp/build-ffmpeg.sh
+                                                chmod +x /tmp/build-ffmpeg.sh
+                                                /tmp/build-ffmpeg.sh linux-x64
 
-                            curl -fsSL "${NWJS_BUILD_SH}" -o /tmp/build-ffmpeg.sh
-                            chmod +x /tmp/build-ffmpeg.sh
+                                                install -Dm755 libffmpeg.so \
+                                                    "/workspace/out/${VERSION}/linux-x64/libffmpeg.so"
+                                            '
 
-                            /tmp/build-ffmpeg.sh linux-x64
+                                        LIB="$VERSION_DIR/libffmpeg.so"
+                                        test -s "$LIB"
+                                        file "$LIB"
+                                        readelf -h "$LIB" | grep -q 'DYN (Shared object file)'
 
-                            install -Dm755 libffmpeg.so /workspace/out/libffmpeg.so
-                        '
-                '''
-            }
-        }
+                                        sha256sum "$LIB" | tee "$VERSION_DIR/libffmpeg.so.sha256"
+                                        SHA256="$(cut -d' ' -f1 "$VERSION_DIR/libffmpeg.so.sha256")"
 
-        stage('Verify') {
-            steps {
-                sh '''#!/usr/bin/env bash
-                    set -euo pipefail
+                                        cat > "$VERSION_DIR/manifest.json" <<EOF
+{
+  "chromium": "${VERSION}",
+  "ffmpeg_commit": "${FFMPEG_REV}",
+  "platform": "linux",
+  "arch": "x64",
+  "sha256": "${SHA256}"
+}
+EOF
 
-                    test -s out/libffmpeg.so
-                    file out/libffmpeg.so
+                                        DEST="s3://${R2_BUCKET}/${R2_PREFIX}/${VERSION}/linux-x64"
 
-                    if ! readelf -h out/libffmpeg.so | grep -q 'DYN (Shared object file)'; then
-                        echo 'libffmpeg.so is not an ELF shared object' >&2
-                        exit 1
-                    fi
+                                        aws s3 cp "$LIB" "${DEST}/libffmpeg.so" \
+                                            --endpoint-url "${R2_ENDPOINT}" \
+                                            --content-type application/octet-stream
 
-                    # The symbol that prompted this builder; keeping this check also catches
-                    # accidentally building an older/incompatible FFmpeg revision.
-                    if ! nm -D out/libffmpeg.so | grep -q 'av_dynamic_hdr_smpte2094_app5_to_t35'; then
-                        echo 'Required symbol av_dynamic_hdr_smpte2094_app5_to_t35 is missing' >&2
-                        exit 1
-                    fi
+                                        aws s3 cp "$VERSION_DIR/libffmpeg.so.sha256" "${DEST}/libffmpeg.so.sha256" \
+                                            --endpoint-url "${R2_ENDPOINT}" \
+                                            --content-type text/plain
 
-                    sha256sum out/libffmpeg.so | tee out/libffmpeg.so.sha256
+                                        # Publish manifest last. Its presence is our atomic marker that
+                                        # this Chromium build is complete and safe to consume.
+                                        aws s3 cp "$VERSION_DIR/manifest.json" "${DEST}/manifest.json" \
+                                            --endpoint-url "${R2_ENDPOINT}" \
+                                            --content-type application/json \
+                                            --cache-control 'public,max-age=300'
 
-                    cat > out/manifest.json <<EOF
-                    {
-                      "chromium": "${CHROMIUM_VERSION}",
-                      "ffmpeg_commit": "$(cat work/ffmpeg-revision.txt)",
-                      "platform": "linux",
-                      "arch": "x64",
-                      "sha256": "$(cut -d' ' -f1 out/libffmpeg.so.sha256)"
+                                        echo "Published Chromium ${VERSION} to ${DEST}/"
+                                    '''
+                                }
+                            }
+                        }
                     }
-                    EOF
-
-                    cat out/manifest.json
-                '''
+                }
             }
         }
 
-        stage('Archive') {
+        stage('Archive manifests') {
             steps {
-                archiveArtifacts artifacts: 'out/*', fingerprint: true
+                archiveArtifacts artifacts: 'out/**/manifest.json,out/**/libffmpeg.so.sha256', allowEmptyArchive: true, fingerprint: true
             }
         }
     }
