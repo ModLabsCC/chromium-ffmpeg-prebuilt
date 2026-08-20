@@ -87,37 +87,29 @@ pipeline {
 
                         MIN_MAJOR="${MIN_MAJOR:-150}"
                         CHROMIUM_VERSION="${CHROMIUM_VERSION:-}"
-                        AUTO_DISCOVER="${AUTO_DISCOVER:-true}"
 
-                        docker run --rm \
-                            -v "$PWD:/workspace" \
-                            -w /workspace \
-                            -e CHROMIUM_VERSION="${CHROMIUM_VERSION}" \
-                            -e AUTO_DISCOVER="${AUTO_DISCOVER}" \
-                            -e MIN_MAJOR="${MIN_MAJOR}" \
-                            -e CHROMIUM_SRC="${CHROMIUM_SRC}" \
-                            "${BUILD_IMAGE}" \
-                            bash -ceu '
-                                apt-get update >/dev/null
-                                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                                    ca-certificates git >/dev/null
+                        if [[ -n "$CHROMIUM_VERSION" ]]; then
+                            printf '%s\\n' "$CHROMIUM_VERSION" > work/candidates.txt
+                        else
+                            docker run --rm \
+                                -e MIN_MAJOR="$MIN_MAJOR" \
+                                -e CHROMIUM_SRC="${CHROMIUM_SRC}" \
+                                "${BUILD_IMAGE}" \
+                                bash -ceu '
+                                    apt-get update >/dev/null
+                                    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                                        ca-certificates git >/dev/null
 
-                                if [[ -n "${CHROMIUM_VERSION}" ]]; then
-                                    printf "%s\\n" "${CHROMIUM_VERSION}" > work/candidates.txt
-                                    exit 0
-                                fi
+                                    git ls-remote --tags --refs "${CHROMIUM_SRC}" \
+                                        | awk "{print \\$2}" \
+                                        | sed "s#refs/tags/##" \
+                                        | grep -E "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$" \
+                                        | awk -F. -v min="${MIN_MAJOR}" "\\$1 >= min" \
+                                        | sort -Vu
+                                ' > work/candidates.txt
+                        fi
 
-                                git ls-remote --tags --refs "${CHROMIUM_SRC}" \
-                                    | awk "{print \\$2}" \
-                                    | sed "s#refs/tags/##" \
-                                    | grep -E "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$" \
-                                    | awk -F. -v min="${MIN_MAJOR}" "\\$1 >= min" \
-                                    | sort -Vu > work/candidates.txt
-                            '
-
-                        docker run --rm \
-                            -v "$PWD:/workspace" \
-                            -w /workspace \
+                        docker run --rm -i \
                             -e AWS_ACCESS_KEY_ID \
                             -e AWS_SECRET_ACCESS_KEY \
                             -e AWS_DEFAULT_REGION=auto \
@@ -130,8 +122,6 @@ pipeline {
                                 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
                                     awscli >/dev/null
 
-                                : > work/versions.txt
-
                                 while IFS= read -r version; do
                                     [[ -n "$version" ]] || continue
                                     key="${R2_PREFIX}/${version}/linux-x64/manifest.json"
@@ -140,16 +130,16 @@ pipeline {
                                         --endpoint-url "${R2_ENDPOINT}" \
                                         --bucket "${R2_BUCKET}" \
                                         --key "$key" >/dev/null 2>&1; then
-                                        echo "Already published: $version"
+                                        echo "Already published: $version" >&2
                                     else
-                                        echo "Missing: $version"
-                                        printf "%s\\n" "$version" >> work/versions.txt
+                                        echo "Missing: $version" >&2
+                                        printf "%s\\n" "$version"
                                     fi
-                                done < work/candidates.txt
+                                done
+                            ' < work/candidates.txt > work/versions.txt
 
-                                echo "Versions queued: $(wc -l < work/versions.txt)"
-                                cat work/versions.txt
-                            '
+                        echo "Versions queued: $(wc -l < work/versions.txt)"
+                        cat work/versions.txt
                     '''
                 }
             }
@@ -186,34 +176,45 @@ pipeline {
 
                                         VERSION="${TARGET_CHROMIUM_VERSION}"
                                         VERSION_DIR="out/${VERSION}/linux-x64"
-                                        WORK_DIR="work/${VERSION}"
-                                        mkdir -p "$VERSION_DIR" "$WORK_DIR"
+                                        mkdir -p "$VERSION_DIR"
 
-                                        echo "Resolving FFmpeg revision for Chromium ${VERSION}"
+                                        BUILD_CID=''
+                                        UPLOAD_CID=''
+                                        cleanup() {
+                                            [[ -z "$BUILD_CID" ]] || docker rm -f "$BUILD_CID" >/dev/null 2>&1 || true
+                                            [[ -z "$UPLOAD_CID" ]] || docker rm -f "$UPLOAD_CID" >/dev/null 2>&1 || true
+                                        }
+                                        trap cleanup EXIT
 
-                                        docker run --rm \
-                                            -v "$PWD:/workspace" \
-                                            -w /workspace \
+                                        echo "Building Chromium ${VERSION}"
+
+                                        BUILD_CID="$(docker create \
                                             -e VERSION="$VERSION" \
                                             -e CHROMIUM_GITILES="${CHROMIUM_GITILES}" \
+                                            -e FFMPEG_GIT="${FFMPEG_GIT}" \
+                                            -e NWJS_BUILD_SH="${NWJS_BUILD_SH}" \
+                                            -e R2_PREFIX="${R2_PREFIX}" \
+                                            -e R2_PUBLIC_BASE="${R2_PUBLIC_BASE}" \
                                             "${BUILD_IMAGE}" \
                                             bash -ceu '
+                                                export DEBIAN_FRONTEND=noninteractive
                                                 apt-get update >/dev/null
-                                                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                                                    ca-certificates curl python3 >/dev/null
+                                                apt-get install -y --no-install-recommends \
+                                                    build-essential ca-certificates curl git nasm yasm \
+                                                    python3 pkg-config xz-utils binutils file >/dev/null
+
+                                                mkdir -p /build /output
+                                                cd /build
 
                                                 curl -fsSL \
                                                     "${CHROMIUM_GITILES}/+/refs/tags/${VERSION}/DEPS?format=TEXT" \
-                                                    | base64 -d > "work/${VERSION}/DEPS"
+                                                    | base64 -d > DEPS
 
-                                                python3 - <<"PY"
-import os
+                                                FFMPEG_REV="$(python3 - <<"PY"
 import re
 from pathlib import Path
 
-version = os.environ["VERSION"]
-text = Path(f"work/{version}/DEPS").read_text()
-
+text = Path("DEPS").read_text()
 pos = text.find("ffmpeg_revision")
 if pos < 0:
     raise SystemExit("Could not find ffmpeg_revision in Chromium DEPS")
@@ -223,53 +224,30 @@ hashes = re.findall("[0-9a-f]{40}", window)
 if not hashes:
     raise SystemExit("Could not resolve ffmpeg_revision from Chromium DEPS")
 
-revision = hashes[0]
-Path(f"work/{version}/ffmpeg-revision.txt").write_text(revision + chr(10))
-print(revision)
+print(hashes[0])
 PY
-                                            '
+                                                )"
 
-                                        FFMPEG_REV="$(cat "$WORK_DIR/ffmpeg-revision.txt")"
-                                        echo "FFmpeg revision: ${FFMPEG_REV}"
+                                                echo "FFmpeg revision: ${FFMPEG_REV}"
+                                                printf "%s\\n" "$FFMPEG_REV" > /output/ffmpeg-revision.txt
 
-                                        docker run --rm \
-                                            -v "$PWD:/workspace" \
-                                            -w /workspace \
-                                            -e VERSION="$VERSION" \
-                                            -e FFMPEG_REV="$FFMPEG_REV" \
-                                            -e FFMPEG_GIT="${FFMPEG_GIT}" \
-                                            -e NWJS_BUILD_SH="${NWJS_BUILD_SH}" \
-                                            "${BUILD_IMAGE}" \
-                                            bash -ceu '
-                                                export DEBIAN_FRONTEND=noninteractive
-                                                apt-get update >/dev/null
-                                                apt-get install -y --no-install-recommends \
-                                                    build-essential ca-certificates curl git nasm yasm \
-                                                    python3 pkg-config xz-utils binutils file >/dev/null
-
-                                                rm -rf "work/${VERSION}/ffmpeg"
-                                                git clone -q "${FFMPEG_GIT}" "work/${VERSION}/ffmpeg"
-                                                cd "work/${VERSION}/ffmpeg"
-                                                git checkout -q "${FFMPEG_REV}"
+                                                git clone -q "${FFMPEG_GIT}" ffmpeg
+                                                cd ffmpeg
+                                                git checkout -q "$FFMPEG_REV"
 
                                                 curl -fsSL "${NWJS_BUILD_SH}" -o /tmp/build-ffmpeg.sh
                                                 chmod +x /tmp/build-ffmpeg.sh
                                                 /tmp/build-ffmpeg.sh linux-x64
 
-                                                install -Dm755 libffmpeg.so \
-                                                    "/workspace/out/${VERSION}/linux-x64/libffmpeg.so"
-                                            '
+                                                install -Dm755 libffmpeg.so /output/libffmpeg.so
+                                                file /output/libffmpeg.so
+                                                readelf -h /output/libffmpeg.so | grep -q "DYN (Shared object file)"
 
-                                        LIB="$VERSION_DIR/libffmpeg.so"
-                                        test -s "$LIB"
-                                        file "$LIB"
-                                        readelf -h "$LIB" | grep -q 'DYN (Shared object file)'
+                                                sha256sum /output/libffmpeg.so > /output/libffmpeg.so.sha256
+                                                SHA256="$(cut -d" " -f1 /output/libffmpeg.so.sha256)"
+                                                PUBLIC_PATH="${R2_PREFIX}/${VERSION}/linux-x64"
 
-                                        sha256sum "$LIB" | tee "$VERSION_DIR/libffmpeg.so.sha256"
-                                        SHA256="$(cut -d' ' -f1 "$VERSION_DIR/libffmpeg.so.sha256")"
-                                        PUBLIC_PATH="${R2_PREFIX}/${VERSION}/linux-x64"
-
-                                        cat > "$VERSION_DIR/manifest.json" <<EOF
+                                                cat > /output/manifest.json <<EOF
 {
   "chromium": "${VERSION}",
   "ffmpeg_commit": "${FFMPEG_REV}",
@@ -279,10 +257,16 @@ PY
   "download_url": "${R2_PUBLIC_BASE}/${PUBLIC_PATH}/libffmpeg.so"
 }
 EOF
+                                            ')"
 
-                                        docker run --rm \
-                                            -v "$PWD:/workspace" \
-                                            -w /workspace \
+                                        docker start -a "$BUILD_CID"
+                                        docker cp "$BUILD_CID:/output/." "$VERSION_DIR/"
+                                        docker rm "$BUILD_CID" >/dev/null
+                                        BUILD_CID=''
+
+                                        cat "$VERSION_DIR/manifest.json"
+
+                                        UPLOAD_CID="$(docker create \
                                             -e AWS_ACCESS_KEY_ID \
                                             -e AWS_SECRET_ACCESS_KEY \
                                             -e AWS_DEFAULT_REGION=auto \
@@ -292,30 +276,33 @@ EOF
                                             -e R2_PREFIX="${R2_PREFIX}" \
                                             "${BUILD_IMAGE}" \
                                             bash -ceu '
+                                                export DEBIAN_FRONTEND=noninteractive
                                                 apt-get update >/dev/null
-                                                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                                                    awscli >/dev/null
+                                                apt-get install -y --no-install-recommends awscli >/dev/null
 
-                                                SRC="out/${VERSION}/linux-x64"
                                                 DEST="s3://${R2_BUCKET}/${R2_PREFIX}/${VERSION}/linux-x64"
 
-                                                aws s3 cp "${SRC}/libffmpeg.so" "${DEST}/libffmpeg.so" \
+                                                aws s3 cp /upload/libffmpeg.so "${DEST}/libffmpeg.so" \
                                                     --endpoint-url "${R2_ENDPOINT}" \
                                                     --content-type application/octet-stream
 
-                                                aws s3 cp "${SRC}/libffmpeg.so.sha256" "${DEST}/libffmpeg.so.sha256" \
+                                                aws s3 cp /upload/libffmpeg.so.sha256 "${DEST}/libffmpeg.so.sha256" \
                                                     --endpoint-url "${R2_ENDPOINT}" \
                                                     --content-type text/plain
 
-                                                # Manifest is written last and acts as the atomic marker
-                                                # that this version is fully published.
-                                                aws s3 cp "${SRC}/manifest.json" "${DEST}/manifest.json" \
+                                                # Manifest goes last and is the atomic completion marker.
+                                                aws s3 cp /upload/manifest.json "${DEST}/manifest.json" \
                                                     --endpoint-url "${R2_ENDPOINT}" \
                                                     --content-type application/json \
                                                     --cache-control "public,max-age=300"
-                                            '
+                                            ')"
 
-                                        echo "Published: ${R2_PUBLIC_BASE}/${PUBLIC_PATH}/"
+                                        docker cp "$VERSION_DIR/." "$UPLOAD_CID:/upload/"
+                                        docker start -a "$UPLOAD_CID"
+                                        docker rm "$UPLOAD_CID" >/dev/null
+                                        UPLOAD_CID=''
+
+                                        echo "Published: ${R2_PUBLIC_BASE}/${R2_PREFIX}/${VERSION}/linux-x64/"
                                     '''
                                 }
                             }
