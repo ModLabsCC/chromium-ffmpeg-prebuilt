@@ -168,8 +168,8 @@ pipeline {
                     docker run --rm \
                         --volumes-from "$(hostname)" \
                         --workdir "${WORKSPACE}" \
-                        --env HOST_UID \
-                        --env HOST_GID \
+                        --env HOST_UID="$HOST_UID" \
+                        --env HOST_GID="$HOST_GID" \
                         --env CHROMIUM_DEPS_RAW \
                         "${BUILD_IMAGE}" \
                         bash -ceu '
@@ -315,8 +315,8 @@ PY
                                 --volumes-from "$(hostname)" \
                                 --workdir "${WORKSPACE}" \
                                 --env FFMPEG_REV="$revision" \
-                                --env HOST_UID \
-                                --env HOST_GID \
+                                --env HOST_UID="$HOST_UID" \
+                                --env HOST_GID="$HOST_GID" \
                                 --env FFMPEG_GIT \
                                 --env NWJS_BUILD_SH \
                                 "${BUILD_IMAGE}" \
