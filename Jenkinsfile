@@ -123,7 +123,7 @@ pipeline {
                                 ' > work/candidates.txt
                         fi
 
-                        # One R2 listing replaces one head-object container per Chromium version.
+                        # One R2 listing replaces one head-object request per Chromium version.
                         docker run --rm \
                             --env AWS_ACCESS_KEY_ID \
                             --env AWS_SECRET_ACCESS_KEY \
@@ -136,7 +136,7 @@ pipeline {
                                 --query 'Contents[].Key' \
                                 --output text \
                             | tr '\t' '\n' \
-                            | sed -n "s#^$R2_PREFIX/\\([^/]*\\)/linux-x64/manifest.json$#\\1#p" \
+                            | awk -F/ -v prefix="$R2_PREFIX" '$1 == prefix && $3 == "linux-x64" && $4 == "manifest.json" { print $2 }' \
                             | sort -Vu > work/published.txt
 
                         comm -23 \
@@ -186,33 +186,28 @@ import concurrent.futures
 import os
 import re
 import sys
-import urllib.error
 import urllib.request
 from pathlib import Path
 
 base = os.environ["CHROMIUM_GITILES"]
 versions = [v.strip() for v in Path("work/versions.txt").read_text().splitlines() if v.strip()]
 workers = min(24, max(1, len(versions)))
-
 sha_re = re.compile(r"[0-9a-f]{40}")
 
 def resolve(version):
     url = f"{base}/+/refs/tags/{version}/DEPS?format=TEXT"
     last_error = None
-    for attempt in range(3):
+    for _ in range(3):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "ModLabsCC-chromium-ffmpeg-prebuilt/1"})
             with urllib.request.urlopen(req, timeout=30) as response:
                 text = base64.b64decode(response.read()).decode("utf-8")
-
             pos = text.find("ffmpeg_revision")
             if pos < 0:
                 raise RuntimeError("ffmpeg_revision not found")
-
             hashes = sha_re.findall(text[pos:pos + 500])
             if not hashes:
                 raise RuntimeError("FFmpeg revision SHA not found")
-
             return version, hashes[0]
         except Exception as exc:
             last_error = exc
@@ -242,14 +237,13 @@ if errors:
 
 with Path("work/mappings.tsv").open("w") as out:
     for version in versions:
-        out.write(f"{version}\\t{results[version]}\\n")
+        out.write(f"{version}\t{results[version]}\n")
 PY
 
                             chown "$HOST_UID:$HOST_GID" work/mappings.tsv
                         '
 
                     cut -f2 work/mappings.tsv | sort -u > work/revisions.txt
-
                     echo "Chromium versions: $(wc -l < work/mappings.tsv)"
                     echo "Unique FFmpeg revisions: $(wc -l < work/revisions.txt)"
                 '''
@@ -280,8 +274,7 @@ PY
                             [[ -n "$revision" ]] || continue
 
                             versions_file="work/versions-$revision.txt"
-                            awk -F '\t' -v revision="$revision" '$2 == revision { print $1 }' \
-                                work/mappings.tsv > "$versions_file"
+                            awk -F '\t' -v revision="$revision" '$2 == revision { print $1 }' work/mappings.tsv > "$versions_file"
 
                             version_count="$(wc -l < "$versions_file")"
                             echo "Building FFmpeg $revision once for $version_count Chromium version(s)"
@@ -323,7 +316,6 @@ PY
                                     file "$BUILD_DIR/libffmpeg.so"
                                     readelf -h "$BUILD_DIR/libffmpeg.so" | grep -q "DYN (Shared object file)"
                                     sha256sum "$BUILD_DIR/libffmpeg.so" > "$BUILD_DIR/libffmpeg.so.sha256"
-
                                     chown -R "$HOST_UID:$HOST_GID" "$BUILD_DIR"
                                 '
 
@@ -389,7 +381,7 @@ EOF
 
                             rm -rf "$BUILD_DIR" "$versions_file"
                         done < work/revisions.txt
-                '''
+                    '''
                 }
             }
         }
