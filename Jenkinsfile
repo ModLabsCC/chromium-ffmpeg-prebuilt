@@ -70,8 +70,11 @@ pipeline {
         stage('Discover releases') {
             steps {
                 withCredentials([
-                    string(credentialsId: 'r2-access-key-id', variable: 'AWS_ACCESS_KEY_ID'),
-                    string(credentialsId: 'r2-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
+                    usernamePassword(
+                        credentialsId: 'r2-credentials',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
                 ]) {
                     sh '''#!/usr/bin/env bash
                         set -euo pipefail
@@ -164,8 +167,11 @@ pipeline {
                         stage("Chromium ${version}") {
                             withEnv(["TARGET_CHROMIUM_VERSION=${version}"]) {
                                 withCredentials([
-                                    string(credentialsId: 'r2-access-key-id', variable: 'AWS_ACCESS_KEY_ID'),
-                                    string(credentialsId: 'r2-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
+                                    usernamePassword(
+                                        credentialsId: 'r2-credentials',
+                                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                                    )
                                 ]) {
                                     sh '''#!/usr/bin/env bash
                                         set -euo pipefail
