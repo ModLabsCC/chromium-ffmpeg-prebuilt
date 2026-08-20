@@ -182,33 +182,65 @@ pipeline {
 import base64
 import concurrent.futures
 import os
+import random
 import re
 import sys
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 base = os.environ["CHROMIUM_GITILES"]
 versions = [v.strip() for v in Path("work/versions.txt").read_text().splitlines() if v.strip()]
-workers = min(24, max(1, len(versions)))
+workers = min(8, max(1, len(versions)))
 sha_re = re.compile(r"[0-9a-f]{40}")
 
 def resolve(version):
     url = f"{base}/+/refs/tags/{version}/DEPS?format=TEXT"
     last_error = None
-    for _ in range(3):
+
+    for attempt in range(8):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "ModLabsCC-chromium-ffmpeg-prebuilt/1"})
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "ModLabsCC-chromium-ffmpeg-prebuilt/1"},
+            )
             with urllib.request.urlopen(req, timeout=30) as response:
                 text = base64.b64decode(response.read()).decode("utf-8")
+
             pos = text.find("ffmpeg_revision")
             if pos < 0:
                 raise RuntimeError("ffmpeg_revision not found")
+
             hashes = sha_re.findall(text[pos:pos + 500])
             if not hashes:
                 raise RuntimeError("FFmpeg revision SHA not found")
+
             return version, hashes[0]
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code == 429 or 500 <= exc.code < 600:
+                retry_after = exc.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    delay = float(retry_after)
+                else:
+                    delay = min(30.0, 1.5 * (2 ** attempt)) + random.uniform(0.0, 1.0)
+                print(
+                    f"{version}: HTTP {exc.code}, retrying in {delay:.1f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(delay)
+                continue
+            raise
         except Exception as exc:
             last_error = exc
+            if attempt < 7:
+                delay = min(15.0, 0.75 * (2 ** attempt)) + random.uniform(0.0, 0.5)
+                time.sleep(delay)
+                continue
+            break
+
     raise RuntimeError(f"{version}: {last_error}")
 
 results = {}
