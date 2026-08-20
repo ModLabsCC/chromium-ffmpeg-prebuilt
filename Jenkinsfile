@@ -123,27 +123,29 @@ pipeline {
                                 ' > work/candidates.txt
                         fi
 
-                        : > work/versions.txt
-                        while IFS= read -r version; do
-                            [[ -n "$version" ]] || continue
-                            key="$R2_PREFIX/$version/linux-x64/manifest.json"
+                        # One R2 listing replaces one head-object container per Chromium version.
+                        docker run --rm \
+                            --env AWS_ACCESS_KEY_ID \
+                            --env AWS_SECRET_ACCESS_KEY \
+                            --env AWS_DEFAULT_REGION=auto \
+                            "${AWS_IMAGE}" \
+                            s3api list-objects-v2 \
+                                --endpoint-url "$R2_ENDPOINT" \
+                                --bucket "$R2_BUCKET" \
+                                --prefix "$R2_PREFIX/" \
+                                --query 'Contents[].Key' \
+                                --output text \
+                            | tr '\t' '\n' \
+                            | sed -n "s#^$R2_PREFIX/\\([^/]*\\)/linux-x64/manifest.json$#\\1#p" \
+                            | sort -Vu > work/published.txt
 
-                            if docker run --rm \
-                                --env AWS_ACCESS_KEY_ID \
-                                --env AWS_SECRET_ACCESS_KEY \
-                                --env AWS_DEFAULT_REGION=auto \
-                                "${AWS_IMAGE}" \
-                                s3api head-object \
-                                    --endpoint-url "$R2_ENDPOINT" \
-                                    --bucket "$R2_BUCKET" \
-                                    --key "$key" >/dev/null 2>&1; then
-                                echo "Already published: $version"
-                            else
-                                echo "Missing: $version"
-                                printf '%s\n' "$version" >> work/versions.txt
-                            fi
-                        done < work/candidates.txt
+                        comm -23 \
+                            <(sort -Vu work/candidates.txt) \
+                            <(sort -Vu work/published.txt) \
+                            > work/versions.txt
 
+                        echo "Chromium candidates: $(wc -l < work/candidates.txt)"
+                        echo "Already published: $(wc -l < work/published.txt)"
                         echo "Chromium versions queued: $(wc -l < work/versions.txt)"
                     '''
                 }
@@ -176,34 +178,72 @@ pipeline {
                             export DEBIAN_FRONTEND=noninteractive
                             apt-get update >/dev/null
                             apt-get install -y --no-install-recommends \
-                                ca-certificates curl python3 >/dev/null
+                                ca-certificates python3 >/dev/null
 
-                            : > work/mappings.tsv
-
-                            while IFS= read -r version; do
-                                [[ -n "$version" ]] || continue
-                                echo "Resolving FFmpeg revision for Chromium $version" >&2
-
-                                deps="$(curl -fsSL "$CHROMIUM_GITILES/+/refs/tags/$version/DEPS?format=TEXT" | base64 -d)"
-                                revision="$(DEPS_TEXT="$deps" python3 - <<"PY"
+                            python3 - <<"PY"
+import base64
+import concurrent.futures
 import os
 import re
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
 
-text = os.environ["DEPS_TEXT"]
-pos = text.find("ffmpeg_revision")
-if pos < 0:
-    raise SystemExit("Could not find ffmpeg_revision in Chromium DEPS")
+base = os.environ["CHROMIUM_GITILES"]
+versions = [v.strip() for v in Path("work/versions.txt").read_text().splitlines() if v.strip()]
+workers = min(24, max(1, len(versions)))
 
-hashes = re.findall("[0-9a-f]{40}", text[pos:pos + 500])
-if not hashes:
-    raise SystemExit("Could not resolve ffmpeg_revision from Chromium DEPS")
+sha_re = re.compile(r"[0-9a-f]{40}")
 
-print(hashes[0])
+def resolve(version):
+    url = f"{base}/+/refs/tags/{version}/DEPS?format=TEXT"
+    last_error = None
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "ModLabsCC-chromium-ffmpeg-prebuilt/1"})
+            with urllib.request.urlopen(req, timeout=30) as response:
+                text = base64.b64decode(response.read()).decode("utf-8")
+
+            pos = text.find("ffmpeg_revision")
+            if pos < 0:
+                raise RuntimeError("ffmpeg_revision not found")
+
+            hashes = sha_re.findall(text[pos:pos + 500])
+            if not hashes:
+                raise RuntimeError("FFmpeg revision SHA not found")
+
+            return version, hashes[0]
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"{version}: {last_error}")
+
+results = {}
+errors = []
+with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+    futures = {pool.submit(resolve, version): version for version in versions}
+    completed = 0
+    for future in concurrent.futures.as_completed(futures):
+        version = futures[future]
+        try:
+            resolved_version, revision = future.result()
+            results[resolved_version] = revision
+        except Exception as exc:
+            errors.append(str(exc))
+        completed += 1
+        if completed % 25 == 0 or completed == len(versions):
+            print(f"Resolved {completed}/{len(versions)} Chromium versions", file=sys.stderr, flush=True)
+
+if errors:
+    print("Resolver failures:", file=sys.stderr)
+    for error in errors:
+        print(f"  {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+with Path("work/mappings.tsv").open("w") as out:
+    for version in versions:
+        out.write(f"{version}\\t{results[version]}\\n")
 PY
-                                )"
-
-                                printf "%s\t%s\n" "$version" "$revision" >> work/mappings.tsv
-                            done < work/versions.txt
 
                             chown "$HOST_UID:$HOST_GID" work/mappings.tsv
                         '
@@ -240,7 +280,7 @@ PY
                             [[ -n "$revision" ]] || continue
 
                             versions_file="work/versions-$revision.txt"
-                            awk -F '	' -v revision="$revision" '$2 == revision { print $1 }' \
+                            awk -F '\t' -v revision="$revision" '$2 == revision { print $1 }' \
                                 work/mappings.tsv > "$versions_file"
 
                             version_count="$(wc -l < "$versions_file")"
@@ -332,7 +372,6 @@ EOF
                                         --endpoint-url "$R2_ENDPOINT" \
                                         --content-type text/plain
 
-                                # Manifest goes last and acts as the atomic completion marker.
                                 docker run --rm \
                                     --volumes-from "$(hostname)" \
                                     --workdir "${WORKSPACE}" \
@@ -348,8 +387,6 @@ EOF
                                 echo "Published Chromium $version from FFmpeg $revision"
                             done < "$versions_file"
 
-                            # Only tiny manifests/checksums remain locally. The source tree,
-                            # object files, and shared binary are discarded after each unique revision.
                             rm -rf "$BUILD_DIR" "$versions_file"
                         done < work/revisions.txt
                 '''
