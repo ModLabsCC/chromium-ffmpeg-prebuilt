@@ -137,11 +137,11 @@ pipeline {
                                 --output text \
                             | tr '\t' '\n' \
                             | awk -F/ -v prefix="$R2_PREFIX" '$1 == prefix && $3 == "linux-x64" && $4 == "manifest.json" { print $2 }' \
-                            | sort -Vu > work/published.txt
+                            > work/published.txt
 
-                        comm -23 \
-                            <(sort -Vu work/candidates.txt) \
-                            <(sort -Vu work/published.txt) \
+                        # Set difference without relying on locale/sort ordering.
+                        awk 'NR == FNR { published[$0] = 1; next } !($0 in published)' \
+                            work/published.txt work/candidates.txt \
                             > work/versions.txt
 
                         echo "Chromium candidates: $(wc -l < work/candidates.txt)"
