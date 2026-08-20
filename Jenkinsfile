@@ -35,7 +35,7 @@ pipeline {
         AWS_IMAGE = 'amazon/aws-cli:latest'
 
         CHROMIUM_SRC = 'https://chromium.googlesource.com/chromium/src.git'
-        CHROMIUM_GITILES = 'https://chromium.googlesource.com/chromium/src'
+        CHROMIUM_DEPS_RAW = 'https://raw.githubusercontent.com/chromium/chromium'
         FFMPEG_GIT = 'https://chromium.googlesource.com/chromium/third_party/ffmpeg.git'
         NWJS_BUILD_SH = 'https://raw.githubusercontent.com/nwjs-ffmpeg-prebuilt/nwjs-ffmpeg-prebuilt/master/build.sh'
 
@@ -170,7 +170,7 @@ pipeline {
                         --workdir "${WORKSPACE}" \
                         --env HOST_UID \
                         --env HOST_GID \
-                        --env CHROMIUM_GITILES \
+                        --env CHROMIUM_DEPS_RAW \
                         "${BUILD_IMAGE}" \
                         bash -ceu '
                             export DEBIAN_FRONTEND=noninteractive
@@ -179,7 +179,6 @@ pipeline {
                                 ca-certificates python3 >/dev/null
 
                             python3 - <<"PY"
-import base64
 import concurrent.futures
 import os
 import random
@@ -190,23 +189,23 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-base = os.environ["CHROMIUM_GITILES"]
+base = os.environ["CHROMIUM_DEPS_RAW"]
 versions = [v.strip() for v in Path("work/versions.txt").read_text().splitlines() if v.strip()]
-workers = min(8, max(1, len(versions)))
+workers = min(12, max(1, len(versions)))
 sha_re = re.compile(r"[0-9a-f]{40}")
 
 def resolve(version):
-    url = f"{base}/+/refs/tags/{version}/DEPS?format=TEXT"
+    url = f"{base}/{version}/DEPS"
     last_error = None
 
-    for attempt in range(8):
+    for attempt in range(6):
         try:
             req = urllib.request.Request(
                 url,
                 headers={"User-Agent": "ModLabsCC-chromium-ffmpeg-prebuilt/1"},
             )
             with urllib.request.urlopen(req, timeout=30) as response:
-                text = base64.b64decode(response.read()).decode("utf-8")
+                text = response.read().decode("utf-8")
 
             pos = text.find("ffmpeg_revision")
             if pos < 0:
@@ -224,7 +223,7 @@ def resolve(version):
                 if retry_after and retry_after.isdigit():
                     delay = float(retry_after)
                 else:
-                    delay = min(30.0, 1.5 * (2 ** attempt)) + random.uniform(0.0, 1.0)
+                    delay = min(20.0, 1.0 * (2 ** attempt)) + random.uniform(0.0, 0.75)
                 print(
                     f"{version}: HTTP {exc.code}, retrying in {delay:.1f}s",
                     file=sys.stderr,
@@ -235,8 +234,8 @@ def resolve(version):
             raise
         except Exception as exc:
             last_error = exc
-            if attempt < 7:
-                delay = min(15.0, 0.75 * (2 ** attempt)) + random.uniform(0.0, 0.5)
+            if attempt < 5:
+                delay = min(10.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.5)
                 time.sleep(delay)
                 continue
             break
