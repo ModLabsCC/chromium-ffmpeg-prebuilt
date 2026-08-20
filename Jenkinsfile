@@ -37,7 +37,6 @@ pipeline {
         CHROMIUM_SRC = 'https://chromium.googlesource.com/chromium/src.git'
         CHROMIUM_DEPS_RAW = 'https://raw.githubusercontent.com/chromium/chromium'
         FFMPEG_GIT = 'https://chromium.googlesource.com/chromium/third_party/ffmpeg.git'
-        NWJS_BUILD_SH = 'https://raw.githubusercontent.com/nwjs-ffmpeg-prebuilt/nwjs-ffmpeg-prebuilt/master/build.sh'
 
         R2_ENDPOINT = 'https://089237543c212eb2e79cae28a2ec3810.r2.cloudflarestorage.com'
         R2_BUCKET = 'chromium-ffmpeg'
@@ -318,13 +317,12 @@ PY
                                 --env HOST_UID="$HOST_UID" \
                                 --env HOST_GID="$HOST_GID" \
                                 --env FFMPEG_GIT \
-                                --env NWJS_BUILD_SH \
                                 "${BUILD_IMAGE}" \
                                 bash -ceu '
                                     export DEBIAN_FRONTEND=noninteractive
                                     apt-get update >/dev/null
                                     apt-get install -y --no-install-recommends \
-                                        build-essential ca-certificates curl git nasm yasm \
+                                        build-essential ca-certificates git nasm yasm \
                                         python3 pkg-config xz-utils binutils file >/dev/null
 
                                     ROOT_DIR="$PWD"
@@ -337,9 +335,8 @@ PY
                                     cd ffmpeg
                                     git checkout -q "$FFMPEG_REV"
 
-                                    curl -fsSL "$NWJS_BUILD_SH" -o /tmp/build-ffmpeg.sh
-                                    chmod +x /tmp/build-ffmpeg.sh
-                                    /tmp/build-ffmpeg.sh linux-x64
+                                    chmod +x "$ROOT_DIR/build.sh"
+                                    "$ROOT_DIR/build.sh" linux-x64
 
                                     cd "$ROOT_DIR"
                                     install -Dm755 "$BUILD_DIR/ffmpeg/libffmpeg.so" "$BUILD_DIR/libffmpeg.so"
