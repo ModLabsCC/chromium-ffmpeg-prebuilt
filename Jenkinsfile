@@ -139,8 +139,9 @@ pipeline {
                             | awk -F/ -v prefix="$R2_PREFIX" '$1 == prefix && $3 == "linux-x64" && $4 == "manifest.json" { print $2 }' \
                             > work/published.txt
 
-                        # Set difference without relying on locale/sort ordering.
-                        awk 'NR == FNR { published[$0] = 1; next } !($0 in published)' \
+                        # Do not use NR == FNR here: when the first file is empty,
+                        # it remains true while reading the second file as well.
+                        awk 'FILENAME == ARGV[1] { published[$0] = 1; next } !($0 in published)' \
                             work/published.txt work/candidates.txt \
                             > work/versions.txt
 
