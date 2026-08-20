@@ -49,6 +49,10 @@ pipeline {
                 sh '''#!/usr/bin/env bash
                     set -euo pipefail
 
+                    MIN_MAJOR="${MIN_MAJOR:-150}"
+                    CHROMIUM_VERSION="${CHROMIUM_VERSION:-}"
+                    AUTO_DISCOVER="${AUTO_DISCOVER:-true}"
+
                     [[ "${MIN_MAJOR}" =~ ^[0-9]+$ ]] || {
                         echo "MIN_MAJOR must be numeric" >&2
                         exit 1
@@ -80,6 +84,10 @@ pipeline {
                         set -euo pipefail
                         rm -rf work out
                         mkdir -p work out
+
+                        MIN_MAJOR="${MIN_MAJOR:-150}"
+                        CHROMIUM_VERSION="${CHROMIUM_VERSION:-}"
+                        AUTO_DISCOVER="${AUTO_DISCOVER:-true}"
 
                         docker run --rm \
                             -v "$PWD:/workspace" \
