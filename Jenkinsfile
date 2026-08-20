@@ -32,6 +32,8 @@ pipeline {
 
     environment {
         BUILD_IMAGE = 'ubuntu:24.04'
+        AWS_IMAGE = 'amazon/aws-cli:latest'
+
         CHROMIUM_SRC = 'https://chromium.googlesource.com/chromium/src.git'
         CHROMIUM_GITILES = 'https://chromium.googlesource.com/chromium/src'
         FFMPEG_GIT = 'https://chromium.googlesource.com/chromium/third_party/ffmpeg.git'
@@ -62,7 +64,7 @@ pipeline {
 
                     if [[ -n "$CHROMIUM_VERSION" ]]; then
                         case "$CHROMIUM_VERSION" in
-                            *[!0-9.]*|.*|*.|*..* )
+                            *[!0-9.]*|.*|*.|*..*)
                                 echo "Invalid Chromium version: $CHROMIUM_VERSION" >&2
                                 exit 1
                                 ;;
@@ -121,36 +123,26 @@ pipeline {
                                 ' > work/candidates.txt
                         fi
 
-                        docker run --rm -i \
-                            --volumes-from "$(hostname)" \
-                            --workdir "${WORKSPACE}" \
-                            --env AWS_ACCESS_KEY_ID \
-                            --env AWS_SECRET_ACCESS_KEY \
-                            --env AWS_DEFAULT_REGION=auto \
-                            --env R2_ENDPOINT \
-                            --env R2_BUCKET \
-                            --env R2_PREFIX \
-                            "${BUILD_IMAGE}" \
-                            bash -ceu '
-                                apt-get update >/dev/null
-                                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                                    awscli >/dev/null
+                        : > work/versions.txt
+                        while IFS= read -r version; do
+                            [[ -n "$version" ]] || continue
+                            key="$R2_PREFIX/$version/linux-x64/manifest.json"
 
-                                while IFS= read -r version; do
-                                    [[ -n "$version" ]] || continue
-                                    key="$R2_PREFIX/$version/linux-x64/manifest.json"
-
-                                    if aws s3api head-object \
-                                        --endpoint-url "$R2_ENDPOINT" \
-                                        --bucket "$R2_BUCKET" \
-                                        --key "$key" >/dev/null 2>&1; then
-                                        echo "Already published: $version" >&2
-                                    else
-                                        echo "Missing: $version" >&2
-                                        printf '%s\n' "$version"
-                                    fi
-                                done
-                            ' < work/candidates.txt > work/versions.txt
+                            if docker run --rm \
+                                --env AWS_ACCESS_KEY_ID \
+                                --env AWS_SECRET_ACCESS_KEY \
+                                --env AWS_DEFAULT_REGION=auto \
+                                "${AWS_IMAGE}" \
+                                s3api head-object \
+                                    --endpoint-url "$R2_ENDPOINT" \
+                                    --bucket "$R2_BUCKET" \
+                                    --key "$key" >/dev/null 2>&1; then
+                                echo "Already published: $version"
+                            else
+                                echo "Missing: $version"
+                                printf '%s\n' "$version" >> work/versions.txt
+                            fi
+                        done < work/candidates.txt
 
                         echo "Versions queued: $(wc -l < work/versions.txt)"
                         cat work/versions.txt
@@ -272,39 +264,43 @@ EOF
 
                                         cat "out/$VERSION/linux-x64/manifest.json"
 
+                                        SRC="out/$VERSION/linux-x64"
+                                        DEST="s3://$R2_BUCKET/$R2_PREFIX/$VERSION/linux-x64"
+
                                         docker run --rm \
                                             --volumes-from "$(hostname)" \
                                             --workdir "${WORKSPACE}" \
                                             --env AWS_ACCESS_KEY_ID \
                                             --env AWS_SECRET_ACCESS_KEY \
                                             --env AWS_DEFAULT_REGION=auto \
-                                            --env VERSION \
-                                            --env R2_ENDPOINT \
-                                            --env R2_BUCKET \
-                                            --env R2_PREFIX \
-                                            "${BUILD_IMAGE}" \
-                                            bash -ceu '
-                                                apt-get update >/dev/null
-                                                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                                                    awscli >/dev/null
+                                            "${AWS_IMAGE}" \
+                                            s3 cp "$SRC/libffmpeg.so" "$DEST/libffmpeg.so" \
+                                                --endpoint-url "$R2_ENDPOINT" \
+                                                --content-type application/octet-stream
 
-                                                SRC="out/$VERSION/linux-x64"
-                                                DEST="s3://$R2_BUCKET/$R2_PREFIX/$VERSION/linux-x64"
+                                        docker run --rm \
+                                            --volumes-from "$(hostname)" \
+                                            --workdir "${WORKSPACE}" \
+                                            --env AWS_ACCESS_KEY_ID \
+                                            --env AWS_SECRET_ACCESS_KEY \
+                                            --env AWS_DEFAULT_REGION=auto \
+                                            "${AWS_IMAGE}" \
+                                            s3 cp "$SRC/libffmpeg.so.sha256" "$DEST/libffmpeg.so.sha256" \
+                                                --endpoint-url "$R2_ENDPOINT" \
+                                                --content-type text/plain
 
-                                                aws s3 cp "$SRC/libffmpeg.so" "$DEST/libffmpeg.so" \
-                                                    --endpoint-url "$R2_ENDPOINT" \
-                                                    --content-type application/octet-stream
-
-                                                aws s3 cp "$SRC/libffmpeg.so.sha256" "$DEST/libffmpeg.so.sha256" \
-                                                    --endpoint-url "$R2_ENDPOINT" \
-                                                    --content-type text/plain
-
-                                                # Publish the manifest last; its presence marks a complete build.
-                                                aws s3 cp "$SRC/manifest.json" "$DEST/manifest.json" \
-                                                    --endpoint-url "$R2_ENDPOINT" \
-                                                    --content-type application/json \
-                                                    --cache-control "public,max-age=300"
-                                            '
+                                        # Manifest goes last and acts as the atomic completion marker.
+                                        docker run --rm \
+                                            --volumes-from "$(hostname)" \
+                                            --workdir "${WORKSPACE}" \
+                                            --env AWS_ACCESS_KEY_ID \
+                                            --env AWS_SECRET_ACCESS_KEY \
+                                            --env AWS_DEFAULT_REGION=auto \
+                                            "${AWS_IMAGE}" \
+                                            s3 cp "$SRC/manifest.json" "$DEST/manifest.json" \
+                                                --endpoint-url "$R2_ENDPOINT" \
+                                                --content-type application/json \
+                                                --cache-control 'public,max-age=300'
 
                                         echo "Published: $R2_PUBLIC_BASE/$R2_PREFIX/$VERSION/linux-x64/"
                                     '''
