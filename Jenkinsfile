@@ -117,7 +117,7 @@ pipeline {
                                     git ls-remote --tags --refs "$CHROMIUM_SRC" \
                                         | awk "{print \\$2}" \
                                         | sed "s#refs/tags/##" \
-                                        | grep -E "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$" \
+                                        | grep -E "^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$" \
                                         | awk -F. -v min="$MIN_MAJOR" "\\$1 >= min" \
                                         | sort -Vu
                                 ' > work/candidates.txt
@@ -144,80 +144,52 @@ pipeline {
                             fi
                         done < work/candidates.txt
 
-                        echo "Versions queued: $(wc -l < work/versions.txt)"
-                        cat work/versions.txt
+                        echo "Chromium versions queued: $(wc -l < work/versions.txt)"
                     '''
                 }
             }
         }
 
-        stage('Build and publish') {
+        stage('Resolve FFmpeg revisions') {
             steps {
-                script {
-                    def versionsText = readFile('work/versions.txt').trim()
-                    if (!versionsText) {
-                        echo 'Nothing to build; R2 already contains all discovered releases.'
-                        return
-                    }
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
 
-                    for (String version : versionsText.split('\\n')) {
-                        version = version.trim()
-                        if (!version) {
-                            continue
-                        }
+                    if [[ ! -s work/versions.txt ]]; then
+                        : > work/mappings.tsv
+                        : > work/revisions.txt
+                        echo 'Nothing to resolve.'
+                        exit 0
+                    fi
 
-                        stage("Chromium ${version}") {
-                            withEnv(["TARGET_CHROMIUM_VERSION=${version}"]) {
-                                withCredentials([
-                                    usernamePassword(
-                                        credentialsId: 'r2-credentials',
-                                        usernameVariable: 'AWS_ACCESS_KEY_ID',
-                                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
-                                    )
-                                ]) {
-                                    sh '''#!/usr/bin/env bash
-                                        set -euo pipefail
+                    HOST_UID="$(id -u)"
+                    HOST_GID="$(id -g)"
 
-                                        VERSION="$TARGET_CHROMIUM_VERSION"
-                                        HOST_UID="$(id -u)"
-                                        HOST_GID="$(id -g)"
+                    docker run --rm \
+                        --volumes-from "$(hostname)" \
+                        --workdir "${WORKSPACE}" \
+                        --env HOST_UID \
+                        --env HOST_GID \
+                        --env CHROMIUM_GITILES \
+                        "${BUILD_IMAGE}" \
+                        bash -ceu '
+                            export DEBIAN_FRONTEND=noninteractive
+                            apt-get update >/dev/null
+                            apt-get install -y --no-install-recommends \
+                                ca-certificates curl python3 >/dev/null
 
-                                        echo "Building Chromium $VERSION"
+                            : > work/mappings.tsv
 
-                                        docker run --rm \
-                                            --volumes-from "$(hostname)" \
-                                            --workdir "${WORKSPACE}" \
-                                            --env VERSION \
-                                            --env HOST_UID \
-                                            --env HOST_GID \
-                                            --env CHROMIUM_GITILES \
-                                            --env FFMPEG_GIT \
-                                            --env NWJS_BUILD_SH \
-                                            --env R2_PREFIX \
-                                            --env R2_PUBLIC_BASE \
-                                            "${BUILD_IMAGE}" \
-                                            bash -ceu '
-                                                export DEBIAN_FRONTEND=noninteractive
-                                                apt-get update >/dev/null
-                                                apt-get install -y --no-install-recommends \
-                                                    build-essential ca-certificates curl git nasm yasm \
-                                                    python3 pkg-config xz-utils binutils file >/dev/null
+                            while IFS= read -r version; do
+                                [[ -n "$version" ]] || continue
+                                echo "Resolving FFmpeg revision for Chromium $version" >&2
 
-                                                WORK_DIR="work/$VERSION"
-                                                OUT_DIR="out/$VERSION/linux-x64"
-                                                rm -rf "$WORK_DIR" "$OUT_DIR"
-                                                mkdir -p "$WORK_DIR" "$OUT_DIR"
-                                                cd "$WORK_DIR"
-
-                                                curl -fsSL \
-                                                    "$CHROMIUM_GITILES/+/refs/tags/$VERSION/DEPS?format=TEXT" \
-                                                    | base64 -d > DEPS
-
-                                                FFMPEG_REV="$(python3 - <<"PY"
+                                deps="$(curl -fsSL "$CHROMIUM_GITILES/+/refs/tags/$version/DEPS?format=TEXT" | base64 -d)"
+                                revision="$(DEPS_TEXT="$deps" python3 - <<"PY"
+import os
 import re
-from pathlib import Path
 
-text = Path("DEPS").read_text()
+text = os.environ["DEPS_TEXT"]
 pos = text.find("ffmpeg_revision")
 if pos < 0:
     raise SystemExit("Could not find ffmpeg_revision in Chromium DEPS")
@@ -228,86 +200,159 @@ if not hashes:
 
 print(hashes[0])
 PY
-                                                )"
+                                )"
 
-                                                echo "FFmpeg revision: $FFMPEG_REV"
-                                                git clone -q "$FFMPEG_GIT" ffmpeg
-                                                cd ffmpeg
-                                                git checkout -q "$FFMPEG_REV"
+                                printf "%s\t%s\n" "$version" "$revision" >> work/mappings.tsv
+                            done < work/versions.txt
 
-                                                curl -fsSL "$NWJS_BUILD_SH" -o /tmp/build-ffmpeg.sh
-                                                chmod +x /tmp/build-ffmpeg.sh
-                                                /tmp/build-ffmpeg.sh linux-x64
+                            chown "$HOST_UID:$HOST_GID" work/mappings.tsv
+                        '
 
-                                                cd "$WORKSPACE"
-                                                install -Dm755 "$WORK_DIR/ffmpeg/libffmpeg.so" "$OUT_DIR/libffmpeg.so"
-                                                file "$OUT_DIR/libffmpeg.so"
-                                                readelf -h "$OUT_DIR/libffmpeg.so" | grep -q "DYN (Shared object file)"
+                    cut -f2 work/mappings.tsv | sort -u > work/revisions.txt
 
-                                                sha256sum "$OUT_DIR/libffmpeg.so" > "$OUT_DIR/libffmpeg.so.sha256"
-                                                SHA256="$(cut -d" " -f1 "$OUT_DIR/libffmpeg.so.sha256")"
-                                                PUBLIC_PATH="$R2_PREFIX/$VERSION/linux-x64"
+                    echo "Chromium versions: $(wc -l < work/mappings.tsv)"
+                    echo "Unique FFmpeg revisions: $(wc -l < work/revisions.txt)"
+                '''
+            }
+        }
 
-                                                cat > "$OUT_DIR/manifest.json" <<EOF
+        stage('Build and publish') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'r2-credentials',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+                    sh '''#!/usr/bin/env bash
+                        set -euo pipefail
+
+                        if [[ ! -s work/revisions.txt ]]; then
+                            echo 'Nothing to build; R2 already contains all discovered releases.'
+                            exit 0
+                        fi
+
+                        HOST_UID="$(id -u)"
+                        HOST_GID="$(id -g)"
+
+                        while IFS= read -r revision; do
+                            [[ -n "$revision" ]] || continue
+
+                            versions_file="work/versions-$revision.txt"
+                            awk -F '	' -v revision="$revision" '$2 == revision { print $1 }' \
+                                work/mappings.tsv > "$versions_file"
+
+                            version_count="$(wc -l < "$versions_file")"
+                            echo "Building FFmpeg $revision once for $version_count Chromium version(s)"
+
+                            BUILD_DIR="work/build-$revision"
+                            rm -rf "$BUILD_DIR"
+
+                            docker run --rm \
+                                --volumes-from "$(hostname)" \
+                                --workdir "${WORKSPACE}" \
+                                --env FFMPEG_REV="$revision" \
+                                --env HOST_UID \
+                                --env HOST_GID \
+                                --env FFMPEG_GIT \
+                                --env NWJS_BUILD_SH \
+                                "${BUILD_IMAGE}" \
+                                bash -ceu '
+                                    export DEBIAN_FRONTEND=noninteractive
+                                    apt-get update >/dev/null
+                                    apt-get install -y --no-install-recommends \
+                                        build-essential ca-certificates curl git nasm yasm \
+                                        python3 pkg-config xz-utils binutils file >/dev/null
+
+                                    BUILD_DIR="work/build-$FFMPEG_REV"
+                                    rm -rf "$BUILD_DIR"
+                                    mkdir -p "$BUILD_DIR"
+                                    cd "$BUILD_DIR"
+
+                                    git clone -q "$FFMPEG_GIT" ffmpeg
+                                    cd ffmpeg
+                                    git checkout -q "$FFMPEG_REV"
+
+                                    curl -fsSL "$NWJS_BUILD_SH" -o /tmp/build-ffmpeg.sh
+                                    chmod +x /tmp/build-ffmpeg.sh
+                                    /tmp/build-ffmpeg.sh linux-x64
+
+                                    cd "$WORKSPACE"
+                                    install -Dm755 "$BUILD_DIR/ffmpeg/libffmpeg.so" "$BUILD_DIR/libffmpeg.so"
+                                    file "$BUILD_DIR/libffmpeg.so"
+                                    readelf -h "$BUILD_DIR/libffmpeg.so" | grep -q "DYN (Shared object file)"
+                                    sha256sum "$BUILD_DIR/libffmpeg.so" > "$BUILD_DIR/libffmpeg.so.sha256"
+
+                                    chown -R "$HOST_UID:$HOST_GID" "$BUILD_DIR"
+                                '
+
+                            LIB="$BUILD_DIR/libffmpeg.so"
+                            SHA256="$(cut -d ' ' -f1 "$BUILD_DIR/libffmpeg.so.sha256")"
+
+                            while IFS= read -r version; do
+                                [[ -n "$version" ]] || continue
+
+                                OUT_DIR="out/$version/linux-x64"
+                                mkdir -p "$OUT_DIR"
+                                printf '%s  libffmpeg.so\n' "$SHA256" > "$OUT_DIR/libffmpeg.so.sha256"
+
+                                cat > "$OUT_DIR/manifest.json" <<EOF
 {
-  "chromium": "$VERSION",
-  "ffmpeg_commit": "$FFMPEG_REV",
+  "chromium": "$version",
+  "ffmpeg_commit": "$revision",
   "platform": "linux",
   "arch": "x64",
   "sha256": "$SHA256",
-  "download_url": "$R2_PUBLIC_BASE/$PUBLIC_PATH/libffmpeg.so"
+  "download_url": "$R2_PUBLIC_BASE/$R2_PREFIX/$version/linux-x64/libffmpeg.so"
 }
 EOF
 
-                                                chown -R "$HOST_UID:$HOST_GID" "$WORK_DIR" "$OUT_DIR"
-                                            '
+                                DEST="s3://$R2_BUCKET/$R2_PREFIX/$version/linux-x64"
 
-                                        cat "out/$VERSION/linux-x64/manifest.json"
+                                docker run --rm \
+                                    --volumes-from "$(hostname)" \
+                                    --workdir "${WORKSPACE}" \
+                                    --env AWS_ACCESS_KEY_ID \
+                                    --env AWS_SECRET_ACCESS_KEY \
+                                    --env AWS_DEFAULT_REGION=auto \
+                                    "${AWS_IMAGE}" \
+                                    s3 cp "$LIB" "$DEST/libffmpeg.so" \
+                                        --endpoint-url "$R2_ENDPOINT" \
+                                        --content-type application/octet-stream
 
-                                        SRC="out/$VERSION/linux-x64"
-                                        DEST="s3://$R2_BUCKET/$R2_PREFIX/$VERSION/linux-x64"
+                                docker run --rm \
+                                    --volumes-from "$(hostname)" \
+                                    --workdir "${WORKSPACE}" \
+                                    --env AWS_ACCESS_KEY_ID \
+                                    --env AWS_SECRET_ACCESS_KEY \
+                                    --env AWS_DEFAULT_REGION=auto \
+                                    "${AWS_IMAGE}" \
+                                    s3 cp "$OUT_DIR/libffmpeg.so.sha256" "$DEST/libffmpeg.so.sha256" \
+                                        --endpoint-url "$R2_ENDPOINT" \
+                                        --content-type text/plain
 
-                                        docker run --rm \
-                                            --volumes-from "$(hostname)" \
-                                            --workdir "${WORKSPACE}" \
-                                            --env AWS_ACCESS_KEY_ID \
-                                            --env AWS_SECRET_ACCESS_KEY \
-                                            --env AWS_DEFAULT_REGION=auto \
-                                            "${AWS_IMAGE}" \
-                                            s3 cp "$SRC/libffmpeg.so" "$DEST/libffmpeg.so" \
-                                                --endpoint-url "$R2_ENDPOINT" \
-                                                --content-type application/octet-stream
+                                # Manifest goes last and acts as the atomic completion marker.
+                                docker run --rm \
+                                    --volumes-from "$(hostname)" \
+                                    --workdir "${WORKSPACE}" \
+                                    --env AWS_ACCESS_KEY_ID \
+                                    --env AWS_SECRET_ACCESS_KEY \
+                                    --env AWS_DEFAULT_REGION=auto \
+                                    "${AWS_IMAGE}" \
+                                    s3 cp "$OUT_DIR/manifest.json" "$DEST/manifest.json" \
+                                        --endpoint-url "$R2_ENDPOINT" \
+                                        --content-type application/json \
+                                        --cache-control 'public,max-age=300'
 
-                                        docker run --rm \
-                                            --volumes-from "$(hostname)" \
-                                            --workdir "${WORKSPACE}" \
-                                            --env AWS_ACCESS_KEY_ID \
-                                            --env AWS_SECRET_ACCESS_KEY \
-                                            --env AWS_DEFAULT_REGION=auto \
-                                            "${AWS_IMAGE}" \
-                                            s3 cp "$SRC/libffmpeg.so.sha256" "$DEST/libffmpeg.so.sha256" \
-                                                --endpoint-url "$R2_ENDPOINT" \
-                                                --content-type text/plain
+                                echo "Published Chromium $version from FFmpeg $revision"
+                            done < "$versions_file"
 
-                                        # Manifest goes last and acts as the atomic completion marker.
-                                        docker run --rm \
-                                            --volumes-from "$(hostname)" \
-                                            --workdir "${WORKSPACE}" \
-                                            --env AWS_ACCESS_KEY_ID \
-                                            --env AWS_SECRET_ACCESS_KEY \
-                                            --env AWS_DEFAULT_REGION=auto \
-                                            "${AWS_IMAGE}" \
-                                            s3 cp "$SRC/manifest.json" "$DEST/manifest.json" \
-                                                --endpoint-url "$R2_ENDPOINT" \
-                                                --content-type application/json \
-                                                --cache-control 'public,max-age=300'
-
-                                        echo "Published: $R2_PUBLIC_BASE/$R2_PREFIX/$VERSION/linux-x64/"
-                                    '''
-                                }
-                            }
-                        }
-                    }
+                            # Only tiny manifests/checksums remain locally. The source tree,
+                            # object files, and shared binary are discarded after each unique revision.
+                            rm -rf "$BUILD_DIR" "$versions_file"
+                        done < work/revisions.txt
+                '''
                 }
             }
         }
