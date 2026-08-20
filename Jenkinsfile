@@ -28,21 +28,6 @@ pipeline {
             defaultValue: '150',
             description: 'Oldest Chromium major to consider in automatic mode'
         )
-        string(
-            name: 'R2_ENDPOINT',
-            defaultValue: '',
-            description: 'Cloudflare R2 S3 endpoint, e.g. https://<account-id>.r2.cloudflarestorage.com'
-        )
-        string(
-            name: 'R2_BUCKET',
-            defaultValue: 'chromium-ffmpeg-prebuilt',
-            description: 'Cloudflare R2 bucket'
-        )
-        string(
-            name: 'R2_PREFIX',
-            defaultValue: 'chromium',
-            description: 'Object prefix inside the bucket'
-        )
     }
 
     environment {
@@ -51,6 +36,11 @@ pipeline {
         CHROMIUM_GITILES = 'https://chromium.googlesource.com/chromium/src'
         FFMPEG_GIT = 'https://chromium.googlesource.com/chromium/third_party/ffmpeg.git'
         NWJS_BUILD_SH = 'https://raw.githubusercontent.com/nwjs-ffmpeg-prebuilt/nwjs-ffmpeg-prebuilt/master/build.sh'
+
+        R2_ENDPOINT = 'https://089237543c212eb2e79cae28a2ec3810.r2.cloudflarestorage.com'
+        R2_BUCKET = 'chromium-ffmpeg'
+        R2_PREFIX = 'chromium'
+        R2_PUBLIC_BASE = 'https://chromium-ffmpeg.modlabs.cc'
     }
 
     stages {
@@ -73,16 +63,6 @@ pipeline {
                         echo 'Either AUTO_DISCOVER must be enabled or CHROMIUM_VERSION must be set' >&2
                         exit 1
                     fi
-
-                    [[ -n "${R2_ENDPOINT}" ]] || {
-                        echo 'R2_ENDPOINT is required' >&2
-                        exit 1
-                    }
-
-                    [[ -n "${R2_BUCKET}" ]] || {
-                        echo 'R2_BUCKET is required' >&2
-                        exit 1
-                    }
                 '''
             }
         }
@@ -98,19 +78,18 @@ pipeline {
                         rm -rf work out
                         mkdir -p work out
 
-                        export AWS_DEFAULT_REGION=auto
-
                         docker run --rm \
                             -v "$PWD:/workspace" \
                             -w /workspace \
                             -e CHROMIUM_VERSION="${CHROMIUM_VERSION}" \
                             -e AUTO_DISCOVER="${AUTO_DISCOVER}" \
                             -e MIN_MAJOR="${MIN_MAJOR}" \
+                            -e CHROMIUM_SRC="${CHROMIUM_SRC}" \
                             "${BUILD_IMAGE}" \
                             bash -ceu '
                                 apt-get update >/dev/null
                                 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                                    ca-certificates git python3 >/dev/null
+                                    ca-certificates git >/dev/null
 
                                 if [[ -n "${CHROMIUM_VERSION}" ]]; then
                                     printf "%s\\n" "${CHROMIUM_VERSION}" > work/candidates.txt
@@ -125,25 +104,41 @@ pipeline {
                                     | sort -Vu > work/candidates.txt
                             '
 
-                        : > work/versions.txt
+                        docker run --rm \
+                            -v "$PWD:/workspace" \
+                            -w /workspace \
+                            -e AWS_ACCESS_KEY_ID \
+                            -e AWS_SECRET_ACCESS_KEY \
+                            -e AWS_DEFAULT_REGION=auto \
+                            -e R2_ENDPOINT="${R2_ENDPOINT}" \
+                            -e R2_BUCKET="${R2_BUCKET}" \
+                            -e R2_PREFIX="${R2_PREFIX}" \
+                            "${BUILD_IMAGE}" \
+                            bash -ceu '
+                                apt-get update >/dev/null
+                                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                                    awscli >/dev/null
 
-                        while IFS= read -r version; do
-                            [[ -n "$version" ]] || continue
-                            key="${R2_PREFIX}/${version}/linux-x64/manifest.json"
+                                : > work/versions.txt
 
-                            if aws s3api head-object \
-                                --endpoint-url "${R2_ENDPOINT}" \
-                                --bucket "${R2_BUCKET}" \
-                                --key "$key" >/dev/null 2>&1; then
-                                echo "Already published: $version"
-                            else
-                                echo "Missing: $version"
-                                printf '%s\\n' "$version" >> work/versions.txt
-                            fi
-                        done < work/candidates.txt
+                                while IFS= read -r version; do
+                                    [[ -n "$version" ]] || continue
+                                    key="${R2_PREFIX}/${version}/linux-x64/manifest.json"
 
-                        echo "Versions queued: $(wc -l < work/versions.txt)"
-                        cat work/versions.txt
+                                    if aws s3api head-object \
+                                        --endpoint-url "${R2_ENDPOINT}" \
+                                        --bucket "${R2_BUCKET}" \
+                                        --key "$key" >/dev/null 2>&1; then
+                                        echo "Already published: $version"
+                                    else
+                                        echo "Missing: $version"
+                                        printf "%s\\n" "$version" >> work/versions.txt
+                                    fi
+                                done < work/candidates.txt
+
+                                echo "Versions queued: $(wc -l < work/versions.txt)"
+                                cat work/versions.txt
+                            '
                     '''
                 }
             }
@@ -175,7 +170,6 @@ pipeline {
                                     sh '''#!/usr/bin/env bash
                                         set -euo pipefail
 
-                                        export AWS_DEFAULT_REGION=auto
                                         VERSION="${TARGET_CHROMIUM_VERSION}"
                                         VERSION_DIR="out/${VERSION}/linux-x64"
                                         WORK_DIR="work/${VERSION}"
@@ -187,6 +181,7 @@ pipeline {
                                             -v "$PWD:/workspace" \
                                             -w /workspace \
                                             -e VERSION="$VERSION" \
+                                            -e CHROMIUM_GITILES="${CHROMIUM_GITILES}" \
                                             "${BUILD_IMAGE}" \
                                             bash -ceu '
                                                 apt-get update >/dev/null
@@ -261,6 +256,7 @@ PY
 
                                         sha256sum "$LIB" | tee "$VERSION_DIR/libffmpeg.so.sha256"
                                         SHA256="$(cut -d' ' -f1 "$VERSION_DIR/libffmpeg.so.sha256")"
+                                        PUBLIC_PATH="${R2_PREFIX}/${VERSION}/linux-x64"
 
                                         cat > "$VERSION_DIR/manifest.json" <<EOF
 {
@@ -268,28 +264,47 @@ PY
   "ffmpeg_commit": "${FFMPEG_REV}",
   "platform": "linux",
   "arch": "x64",
-  "sha256": "${SHA256}"
+  "sha256": "${SHA256}",
+  "download_url": "${R2_PUBLIC_BASE}/${PUBLIC_PATH}/libffmpeg.so"
 }
 EOF
 
-                                        DEST="s3://${R2_BUCKET}/${R2_PREFIX}/${VERSION}/linux-x64"
+                                        docker run --rm \
+                                            -v "$PWD:/workspace" \
+                                            -w /workspace \
+                                            -e AWS_ACCESS_KEY_ID \
+                                            -e AWS_SECRET_ACCESS_KEY \
+                                            -e AWS_DEFAULT_REGION=auto \
+                                            -e VERSION="$VERSION" \
+                                            -e R2_ENDPOINT="${R2_ENDPOINT}" \
+                                            -e R2_BUCKET="${R2_BUCKET}" \
+                                            -e R2_PREFIX="${R2_PREFIX}" \
+                                            "${BUILD_IMAGE}" \
+                                            bash -ceu '
+                                                apt-get update >/dev/null
+                                                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                                                    awscli >/dev/null
 
-                                        aws s3 cp "$LIB" "${DEST}/libffmpeg.so" \
-                                            --endpoint-url "${R2_ENDPOINT}" \
-                                            --content-type application/octet-stream
+                                                SRC="out/${VERSION}/linux-x64"
+                                                DEST="s3://${R2_BUCKET}/${R2_PREFIX}/${VERSION}/linux-x64"
 
-                                        aws s3 cp "$VERSION_DIR/libffmpeg.so.sha256" "${DEST}/libffmpeg.so.sha256" \
-                                            --endpoint-url "${R2_ENDPOINT}" \
-                                            --content-type text/plain
+                                                aws s3 cp "${SRC}/libffmpeg.so" "${DEST}/libffmpeg.so" \
+                                                    --endpoint-url "${R2_ENDPOINT}" \
+                                                    --content-type application/octet-stream
 
-                                        # Publish manifest last. Its presence is our atomic marker that
-                                        # this Chromium build is complete and safe to consume.
-                                        aws s3 cp "$VERSION_DIR/manifest.json" "${DEST}/manifest.json" \
-                                            --endpoint-url "${R2_ENDPOINT}" \
-                                            --content-type application/json \
-                                            --cache-control 'public,max-age=300'
+                                                aws s3 cp "${SRC}/libffmpeg.so.sha256" "${DEST}/libffmpeg.so.sha256" \
+                                                    --endpoint-url "${R2_ENDPOINT}" \
+                                                    --content-type text/plain
 
-                                        echo "Published Chromium ${VERSION} to ${DEST}/"
+                                                # Manifest is written last and acts as the atomic marker
+                                                # that this version is fully published.
+                                                aws s3 cp "${SRC}/manifest.json" "${DEST}/manifest.json" \
+                                                    --endpoint-url "${R2_ENDPOINT}" \
+                                                    --content-type application/json \
+                                                    --cache-control "public,max-age=300"
+                                            '
+
+                                        echo "Published: ${R2_PUBLIC_BASE}/${PUBLIC_PATH}/"
                                     '''
                                 }
                             }
