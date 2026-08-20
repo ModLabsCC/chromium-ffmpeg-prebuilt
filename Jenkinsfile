@@ -123,7 +123,6 @@ pipeline {
                                 ' > work/candidates.txt
                         fi
 
-                        # One R2 listing replaces one head-object request per Chromium version.
                         docker run --rm \
                             --env AWS_ACCESS_KEY_ID \
                             --env AWS_SECRET_ACCESS_KEY \
@@ -139,8 +138,6 @@ pipeline {
                             | awk -F/ -v prefix="$R2_PREFIX" '$1 == prefix && $3 == "linux-x64" && $4 == "manifest.json" { print $2 }' \
                             > work/published.txt
 
-                        # Do not use NR == FNR here: when the first file is empty,
-                        # it remains true while reading the second file as well.
                         awk 'FILENAME == ARGV[1] { published[$0] = 1; next } !($0 in published)' \
                             work/published.txt work/candidates.txt \
                             > work/versions.txt
@@ -238,7 +235,7 @@ if errors:
 
 with Path("work/mappings.tsv").open("w") as out:
     for version in versions:
-        out.write(f"{version}\t{results[version]}\n")
+        print(version, results[version], sep=chr(9), file=out)
 PY
 
                             chown "$HOST_UID:$HOST_GID" work/mappings.tsv
