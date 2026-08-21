@@ -31,7 +31,7 @@ pipeline {
     }
 
     environment {
-        BUILD_IMAGE = 'ubuntu:24.04'
+        BUILD_IMAGE = 'modlabs/chromium-ffmpeg-builder:local'
         AWS_IMAGE = 'amazon/aws-cli:latest'
 
         CHROMIUM_SRC = 'https://chromium.googlesource.com/chromium/src.git'
@@ -82,6 +82,12 @@ pipeline {
             }
         }
 
+        stage('Prepare build image') {
+            steps {
+                sh 'docker build --pull --tag "$BUILD_IMAGE" .'
+            }
+        }
+
         stage('Discover releases') {
             steps {
                 withCredentials([
@@ -105,14 +111,12 @@ pipeline {
                             docker run --rm \
                                 --volumes-from "$(hostname)" \
                                 --workdir "${WORKSPACE}" \
+                                --user "$(id -u):$(id -g)" \
+                                --env HOME=/tmp \
                                 --env MIN_MAJOR="$MIN_MAJOR" \
                                 --env CHROMIUM_SRC \
                                 "${BUILD_IMAGE}" \
                                 bash -ceu '
-                                    apt-get update >/dev/null
-                                    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                                        ca-certificates git >/dev/null
-
                                     git ls-remote --tags --refs "$CHROMIUM_SRC" \
                                         | awk "{print \\$2}" \
                                         | sed "s#refs/tags/##" \
@@ -161,22 +165,14 @@ pipeline {
                         exit 0
                     fi
 
-                    HOST_UID="$(id -u)"
-                    HOST_GID="$(id -g)"
-
                     docker run --rm \
                         --volumes-from "$(hostname)" \
                         --workdir "${WORKSPACE}" \
-                        --env HOST_UID="$HOST_UID" \
-                        --env HOST_GID="$HOST_GID" \
+                        --user "$(id -u):$(id -g)" \
+                        --env HOME=/tmp \
                         --env CHROMIUM_DEPS_RAW \
                         "${BUILD_IMAGE}" \
                         bash -ceu '
-                            export DEBIAN_FRONTEND=noninteractive
-                            apt-get update >/dev/null
-                            apt-get install -y --no-install-recommends \
-                                ca-certificates python3 >/dev/null
-
                             python3 - <<"PY"
 import concurrent.futures
 import os
@@ -267,8 +263,6 @@ with Path("work/mappings.tsv").open("w") as out:
     for version in versions:
         print(version, results[version], sep=chr(9), file=out)
 PY
-
-                            chown "$HOST_UID:$HOST_GID" work/mappings.tsv
                         '
 
                     cut -f2 work/mappings.tsv | sort -u > work/revisions.txt
@@ -295,9 +289,6 @@ PY
                             exit 0
                         fi
 
-                        HOST_UID="$(id -u)"
-                        HOST_GID="$(id -g)"
-
                         while IFS= read -r revision; do
                             [[ -n "$revision" ]] || continue
 
@@ -313,18 +304,12 @@ PY
                             docker run --rm \
                                 --volumes-from "$(hostname)" \
                                 --workdir "${WORKSPACE}" \
+                                --user "$(id -u):$(id -g)" \
+                                --env HOME=/tmp \
                                 --env FFMPEG_REV="$revision" \
-                                --env HOST_UID="$HOST_UID" \
-                                --env HOST_GID="$HOST_GID" \
                                 --env FFMPEG_GIT \
                                 "${BUILD_IMAGE}" \
                                 bash -ceu '
-                                    export DEBIAN_FRONTEND=noninteractive
-                                    apt-get update >/dev/null
-                                    apt-get install -y --no-install-recommends \
-                                        build-essential ca-certificates git nasm yasm \
-                                        python3 pkg-config xz-utils binutils file >/dev/null
-
                                     ROOT_DIR="$PWD"
                                     BUILD_DIR="work/build-$FFMPEG_REV"
                                     rm -rf "$BUILD_DIR"
@@ -343,7 +328,6 @@ PY
                                     file "$BUILD_DIR/libffmpeg.so"
                                     readelf -h "$BUILD_DIR/libffmpeg.so" | grep -q "DYN (Shared object file)"
                                     sha256sum "$BUILD_DIR/libffmpeg.so" > "$BUILD_DIR/libffmpeg.so.sha256"
-                                    chown -R "$HOST_UID:$HOST_GID" "$BUILD_DIR"
                                 '
 
                             LIB="$BUILD_DIR/libffmpeg.so"
@@ -426,7 +410,7 @@ EOF
 
     post {
         always {
-            cleanWs(deleteDirs: true, notFailBuild: true)
+            cleanWs(deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
         }
     }
 }
