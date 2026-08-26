@@ -302,11 +302,49 @@ PY
                             local release_json="$out_dir/github-release.json"
                             local status release_body release_id asset_id
 
-                            status="$(curl --silent --show-error --output "$release_json" --write-out '%{http_code}' \
+                            status="$(curl --silent --show-error --retry 6 --retry-all-errors --retry-delay 2 \
+                                --output "$release_json" --write-out '%{http_code}' \
                                 --header 'Accept: application/vnd.github+json' \
                                 --header "Authorization: Bearer $GH_TOKEN" \
                                 --header 'X-GitHub-Api-Version: 2022-11-28' \
                                 "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$tag")"
+
+                            if [[ "$status" == 200 ]]; then
+                                read -r release_id asset_id < <(
+                                    docker run --rm \
+                                        --volumes-from "$(hostname)" \
+                                        --workdir "${WORKSPACE}" \
+                                        "${BUILD_IMAGE}" \
+                                        python3 -c 'import json, sys; release = json.load(open(sys.argv[1])); print(release["id"], next((asset["id"] for asset in release["assets"] if asset["name"] == "libffmpeg.so"), ""))' \
+                                        "$release_json"
+                                )
+
+                                if [[ -n "$asset_id" ]]; then
+                                    echo "GitHub release $tag already contains libffmpeg.so"
+                                    rm -f "$release_json"
+                                    return
+                                fi
+                            elif [[ "$status" != 404 ]]; then
+                                cat "$release_json" >&2
+                                return 1
+                            fi
+
+                            if [[ -z "$revision" || -z "$sha256" ]]; then
+                                curl --fail-with-body --silent --show-error \
+                                    --retry 6 --retry-all-errors --retry-delay 2 \
+                                    --output "$out_dir/manifest.json" \
+                                    "$R2_PUBLIC_BASE/$R2_PREFIX/$version/linux-x64/manifest.json"
+
+                                read -r revision sha256 < <(
+                                    docker run --rm \
+                                        --volumes-from "$(hostname)" \
+                                        --workdir "${WORKSPACE}" \
+                                        "${BUILD_IMAGE}" \
+                                        python3 -c 'import json, re, sys; manifest = json.load(open(sys.argv[1])); version = sys.argv[2]; revision = manifest["ffmpeg_commit"]; sha256 = manifest["sha256"]; assert manifest["chromium"] == version and re.fullmatch(r"[0-9a-f]{40}", revision) and re.fullmatch(r"[0-9a-f]{64}", sha256); print(revision, sha256)' \
+                                        "$out_dir/manifest.json" "$version"
+                                )
+                                printf '%s  libffmpeg.so\n' "$sha256" > "$out_dir/libffmpeg.so.sha256"
+                            fi
 
                             if [[ "$status" == 404 ]]; then
                                 release_body="$(printf \
@@ -320,41 +358,32 @@ PY
                                     --data "$release_body" \
                                     --output "$release_json" \
                                     "https://api.github.com/repos/$GITHUB_REPOSITORY/releases"
-                            elif [[ "$status" != 200 ]]; then
-                                cat "$release_json" >&2
-                                return 1
-                            fi
-
-                            read -r release_id asset_id < <(
-                                docker run --rm \
+                                release_id="$(docker run --rm \
                                     --volumes-from "$(hostname)" \
                                     --workdir "${WORKSPACE}" \
                                     "${BUILD_IMAGE}" \
-                                    python3 -c 'import json, sys; release = json.load(open(sys.argv[1])); print(release["id"], next((asset["id"] for asset in release["assets"] if asset["name"] == "libffmpeg.so"), ""))' \
-                                    "$release_json"
-                            )
-
-                            if [[ -z "$asset_id" ]]; then
-                                if [[ ! -f "$lib" ]]; then
-                                    curl --fail-with-body --silent --show-error \
-                                        --output "$lib" \
-                                        "$R2_PUBLIC_BASE/$R2_PREFIX/$version/linux-x64/libffmpeg.so"
-                                    printf '%s  %s\n' "$sha256" "$lib" | sha256sum --check
-                                fi
-
-                                curl --fail-with-body --silent --show-error \
-                                    --request POST \
-                                    --header 'Accept: application/vnd.github+json' \
-                                    --header "Authorization: Bearer $GH_TOKEN" \
-                                    --header 'X-GitHub-Api-Version: 2022-11-28' \
-                                    --header 'Content-Type: application/octet-stream' \
-                                    --data-binary "@$lib" \
-                                    --output /dev/null \
-                                    "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=libffmpeg.so"
-                                echo "Published GitHub release $tag"
-                            else
-                                echo "GitHub release $tag already contains libffmpeg.so"
+                                    python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["id"])' \
+                                    "$release_json")"
                             fi
+
+                            if [[ ! -f "$lib" ]]; then
+                                curl --fail-with-body --silent --show-error \
+                                    --retry 6 --retry-all-errors --retry-delay 2 \
+                                    --output "$lib" \
+                                    "$R2_PUBLIC_BASE/$R2_PREFIX/$version/linux-x64/libffmpeg.so"
+                                printf '%s  %s\n' "$sha256" "$lib" | sha256sum --check
+                            fi
+
+                            curl --fail-with-body --silent --show-error \
+                                --request POST \
+                                --header 'Accept: application/vnd.github+json' \
+                                --header "Authorization: Bearer $GH_TOKEN" \
+                                --header 'X-GitHub-Api-Version: 2022-11-28' \
+                                --header 'Content-Type: application/octet-stream' \
+                                --data-binary "@$lib" \
+                                --output /dev/null \
+                                "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=libffmpeg.so"
+                            echo "Published GitHub release $tag"
 
                             rm -f "$release_json"
                         }
@@ -373,20 +402,7 @@ PY
                                 OUT_DIR="out/$version/linux-x64"
                                 LIB="$OUT_DIR/libffmpeg.so"
                                 mkdir -p "$OUT_DIR"
-                                curl --fail-with-body --silent --show-error \
-                                    --output "$OUT_DIR/manifest.json" \
-                                    "$R2_PUBLIC_BASE/$R2_PREFIX/$version/linux-x64/manifest.json"
-
-                                read -r revision SHA256 < <(
-                                    docker run --rm \
-                                        --volumes-from "$(hostname)" \
-                                        --workdir "${WORKSPACE}" \
-                                        "${BUILD_IMAGE}" \
-                                        python3 -c 'import json, re, sys; manifest = json.load(open(sys.argv[1])); version = sys.argv[2]; revision = manifest["ffmpeg_commit"]; sha256 = manifest["sha256"]; assert manifest["chromium"] == version and re.fullmatch(r"[0-9a-f]{40}", revision) and re.fullmatch(r"[0-9a-f]{64}", sha256); print(revision, sha256)' \
-                                        "$OUT_DIR/manifest.json" "$version"
-                                )
-                                printf '%s  libffmpeg.so\n' "$SHA256" > "$OUT_DIR/libffmpeg.so.sha256"
-                                publish_github_release "$version" "$revision" "$SHA256" "$LIB" "$OUT_DIR"
+                                publish_github_release "$version" '' '' "$LIB" "$OUT_DIR"
                                 rm -f "$LIB"
                             done < work/backfill.txt
                         fi
