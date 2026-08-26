@@ -296,6 +296,27 @@ PY
                     sh '''#!/usr/bin/env bash
                         set -euo pipefail
 
+                        download_r2() {
+                            local version="$1" object="$2" destination="$3"
+                            local source="s3://$R2_BUCKET/$R2_PREFIX/$version/linux-x64/$object"
+
+                            echo "Downloading $source"
+                            docker run --rm \
+                                --volumes-from "$(hostname)" \
+                                --workdir "${WORKSPACE}" \
+                                --user "$(id -u):$(id -g)" \
+                                --env HOME=/tmp \
+                                --env AWS_ACCESS_KEY_ID \
+                                --env AWS_SECRET_ACCESS_KEY \
+                                --env AWS_DEFAULT_REGION=auto \
+                                --env AWS_RETRY_MODE=standard \
+                                --env AWS_MAX_ATTEMPTS=6 \
+                                "${AWS_IMAGE}" \
+                                s3 cp "$source" "$destination" \
+                                    --endpoint-url "$R2_ENDPOINT" \
+                                    --only-show-errors
+                        }
+
                         publish_github_release() {
                             local version="$1" revision="$2" sha256="$3" lib="$4" out_dir="$5"
                             local tag="chromium-$version"
@@ -330,10 +351,7 @@ PY
                             fi
 
                             if [[ -z "$revision" || -z "$sha256" ]]; then
-                                curl --fail-with-body --silent --show-error \
-                                    --retry 6 --retry-all-errors --retry-delay 2 \
-                                    --output "$out_dir/manifest.json" \
-                                    "$R2_PUBLIC_BASE/$R2_PREFIX/$version/linux-x64/manifest.json"
+                                download_r2 "$version" manifest.json "$out_dir/manifest.json"
 
                                 read -r revision sha256 < <(
                                     docker run --rm \
@@ -367,10 +385,7 @@ PY
                             fi
 
                             if [[ ! -f "$lib" ]]; then
-                                curl --fail-with-body --silent --show-error \
-                                    --retry 6 --retry-all-errors --retry-delay 2 \
-                                    --output "$lib" \
-                                    "$R2_PUBLIC_BASE/$R2_PREFIX/$version/linux-x64/libffmpeg.so"
+                                download_r2 "$version" libffmpeg.so "$lib"
                                 printf '%s  %s\n' "$sha256" "$lib" | sha256sum --check
                             fi
 
