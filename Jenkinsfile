@@ -18,6 +18,11 @@ pipeline {
             defaultValue: true,
             description: 'Discover and build every missing Chromium release tag'
         )
+        booleanParam(
+            name: 'BACKFILL_GITHUB',
+            defaultValue: false,
+            description: 'Upload existing R2 binaries missing from GitHub Releases without rebuilding them'
+        )
         string(
             name: 'CHROMIUM_VERSION',
             defaultValue: '',
@@ -42,6 +47,8 @@ pipeline {
         R2_BUCKET = 'chromium-ffmpeg'
         R2_PREFIX = 'chromium'
         R2_PUBLIC_BASE = 'https://chromium-ffmpeg.modlabs.cc'
+
+        GITHUB_REPOSITORY = 'ModLabsCC/chromium-ffmpeg-prebuilt'
     }
 
     stages {
@@ -53,6 +60,7 @@ pipeline {
                     MIN_MAJOR="${MIN_MAJOR:-150}"
                     CHROMIUM_VERSION="${CHROMIUM_VERSION:-}"
                     AUTO_DISCOVER="${AUTO_DISCOVER:-true}"
+                    BACKFILL_GITHUB="${BACKFILL_GITHUB:-false}"
 
                     case "$MIN_MAJOR" in
                         ''|*[!0-9]*)
@@ -74,8 +82,8 @@ pipeline {
                             echo "Invalid Chromium version: $CHROMIUM_VERSION" >&2
                             exit 1
                         fi
-                    elif [[ "$AUTO_DISCOVER" != true ]]; then
-                        echo 'Either AUTO_DISCOVER must be enabled or CHROMIUM_VERSION must be set' >&2
+                    elif [[ "$AUTO_DISCOVER" != true && "$BACKFILL_GITHUB" != true ]]; then
+                        echo 'Enable AUTO_DISCOVER or BACKFILL_GITHUB, or set CHROMIUM_VERSION' >&2
                         exit 1
                     fi
                 '''
@@ -104,10 +112,11 @@ pipeline {
 
                         MIN_MAJOR="${MIN_MAJOR:-150}"
                         CHROMIUM_VERSION="${CHROMIUM_VERSION:-}"
+                        AUTO_DISCOVER="${AUTO_DISCOVER:-true}"
 
                         if [[ -n "$CHROMIUM_VERSION" ]]; then
                             printf '%s\n' "$CHROMIUM_VERSION" > work/candidates.txt
-                        else
+                        elif [[ "$AUTO_DISCOVER" == true ]]; then
                             docker run --rm \
                                 --volumes-from "$(hostname)" \
                                 --workdir "${WORKSPACE}" \
@@ -124,6 +133,8 @@ pipeline {
                                         | awk -F. -v min="$MIN_MAJOR" "\\$1 >= min" \
                                         | sort -Vu
                                 ' > work/candidates.txt
+                        else
+                            : > work/candidates.txt
                         fi
 
                         docker run --rm \
@@ -138,7 +149,7 @@ pipeline {
                                 --query 'Contents[].Key' \
                                 --output text \
                             | tr '\t' '\n' \
-                            | awk -F/ -v prefix="$R2_PREFIX" '$1 == prefix && $3 == "linux-x64" && $4 == "manifest.json" { print $2 }' \
+                            | awk -F/ -v prefix="$R2_PREFIX" '$1 == prefix && $2 ~ /^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$/ && $3 == "linux-x64" && $4 == "manifest.json" { print $2 }' \
                             > work/published.txt
 
                         awk 'FILENAME == ARGV[1] { published[$0] = 1; next } !($0 in published)' \
@@ -279,13 +290,109 @@ PY
                         credentialsId: 'r2-credentials',
                         usernameVariable: 'AWS_ACCESS_KEY_ID',
                         passwordVariable: 'AWS_SECRET_ACCESS_KEY'
-                    )
+                    ),
+                    string(credentialsId: 'chromium-ffmpeg-github-token', variable: 'GH_TOKEN')
                 ]) {
                     sh '''#!/usr/bin/env bash
                         set -euo pipefail
 
+                        publish_github_release() {
+                            local version="$1" revision="$2" sha256="$3" lib="$4" out_dir="$5"
+                            local tag="chromium-$version"
+                            local release_json="$out_dir/github-release.json"
+                            local status release_body release_id asset_id
+
+                            status="$(curl --silent --show-error --output "$release_json" --write-out '%{http_code}' \
+                                --header 'Accept: application/vnd.github+json' \
+                                --header "Authorization: Bearer $GH_TOKEN" \
+                                --header 'X-GitHub-Api-Version: 2022-11-28' \
+                                "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$tag")"
+
+                            if [[ "$status" == 404 ]]; then
+                                release_body="$(printf \
+                                    '{"tag_name":"%s","target_commitish":"%s","name":"Chromium %s","body":"Linux x64 libffmpeg.so built from FFmpeg commit %s. SHA-256: %s","make_latest":"false"}' \
+                                    "$tag" "$GIT_COMMIT" "$version" "$revision" "$sha256")"
+                                curl --fail-with-body --silent --show-error \
+                                    --request POST \
+                                    --header 'Accept: application/vnd.github+json' \
+                                    --header "Authorization: Bearer $GH_TOKEN" \
+                                    --header 'X-GitHub-Api-Version: 2022-11-28' \
+                                    --data "$release_body" \
+                                    --output "$release_json" \
+                                    "https://api.github.com/repos/$GITHUB_REPOSITORY/releases"
+                            elif [[ "$status" != 200 ]]; then
+                                cat "$release_json" >&2
+                                return 1
+                            fi
+
+                            read -r release_id asset_id < <(
+                                docker run --rm \
+                                    --volumes-from "$(hostname)" \
+                                    --workdir "${WORKSPACE}" \
+                                    "${BUILD_IMAGE}" \
+                                    python3 -c 'import json, sys; release = json.load(open(sys.argv[1])); print(release["id"], next((asset["id"] for asset in release["assets"] if asset["name"] == "libffmpeg.so"), ""))' \
+                                    "$release_json"
+                            )
+
+                            if [[ -z "$asset_id" ]]; then
+                                if [[ ! -f "$lib" ]]; then
+                                    curl --fail-with-body --silent --show-error \
+                                        --output "$lib" \
+                                        "$R2_PUBLIC_BASE/$R2_PREFIX/$version/linux-x64/libffmpeg.so"
+                                    printf '%s  %s\n' "$sha256" "$lib" | sha256sum --check
+                                fi
+
+                                curl --fail-with-body --silent --show-error \
+                                    --request POST \
+                                    --header 'Accept: application/vnd.github+json' \
+                                    --header "Authorization: Bearer $GH_TOKEN" \
+                                    --header 'X-GitHub-Api-Version: 2022-11-28' \
+                                    --header 'Content-Type: application/octet-stream' \
+                                    --data-binary "@$lib" \
+                                    --output /dev/null \
+                                    "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=libffmpeg.so"
+                                echo "Published GitHub release $tag"
+                            else
+                                echo "GitHub release $tag already contains libffmpeg.so"
+                            fi
+
+                            rm -f "$release_json"
+                        }
+
+                        if [[ "${BACKFILL_GITHUB:-false}" == true ]]; then
+                            if [[ -n "${CHROMIUM_VERSION:-}" ]]; then
+                                grep -Fx "$CHROMIUM_VERSION" work/published.txt > work/backfill.txt || true
+                            else
+                                cp work/published.txt work/backfill.txt
+                            fi
+
+                            echo "R2 binaries queued for GitHub backfill: $(wc -l < work/backfill.txt)"
+                            while IFS= read -r version; do
+                                [[ -n "$version" ]] || continue
+
+                                OUT_DIR="out/$version/linux-x64"
+                                LIB="$OUT_DIR/libffmpeg.so"
+                                mkdir -p "$OUT_DIR"
+                                curl --fail-with-body --silent --show-error \
+                                    --output "$OUT_DIR/manifest.json" \
+                                    "$R2_PUBLIC_BASE/$R2_PREFIX/$version/linux-x64/manifest.json"
+
+                                read -r revision SHA256 < <(
+                                    docker run --rm \
+                                        --volumes-from "$(hostname)" \
+                                        --workdir "${WORKSPACE}" \
+                                        "${BUILD_IMAGE}" \
+                                        python3 -c 'import json, re, sys; manifest = json.load(open(sys.argv[1])); version = sys.argv[2]; revision = manifest["ffmpeg_commit"]; sha256 = manifest["sha256"]; assert manifest["chromium"] == version and re.fullmatch(r"[0-9a-f]{40}", revision) and re.fullmatch(r"[0-9a-f]{64}", sha256); print(revision, sha256)' \
+                                        "$OUT_DIR/manifest.json" "$version"
+                                )
+                                printf '%s  libffmpeg.so\n' "$SHA256" > "$OUT_DIR/libffmpeg.so.sha256"
+                                publish_github_release "$version" "$revision" "$SHA256" "$LIB" "$OUT_DIR"
+                                rm -f "$LIB"
+                            done < work/backfill.txt
+                        fi
+
                         if [[ ! -s work/revisions.txt ]]; then
-                            echo 'Nothing to build; R2 already contains all discovered releases.'
+                            echo 'Nothing new to build; R2 already contains all discovered releases.'
                             exit 0
                         fi
 
@@ -352,6 +459,7 @@ PY
 EOF
 
                                 DEST="s3://$R2_BUCKET/$R2_PREFIX/$version/linux-x64"
+                                publish_github_release "$version" "$revision" "$SHA256" "$LIB" "$OUT_DIR"
 
                                 docker run --rm \
                                     --volumes-from "$(hostname)" \
